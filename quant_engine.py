@@ -21,13 +21,14 @@ import argparse
 import sqlite3
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "quant_historic_data.db"
 HEATMAP_TABLE = "rsi_heatmap_data"
+IST = timezone(timedelta(hours=5, minutes=30))
 SYSTEM_TABLES = {
     "stocks_rsi_cagrs",
     "market_data",
@@ -44,7 +45,7 @@ REQUIRED_COLS = {"trade_date", "close", "rsi"}
 
 
 def utc_now() -> str:
-    return datetime.utcnow().replace(microsecond=0).isoformat()
+    return datetime.now(IST).replace(microsecond=0).isoformat()
 
 
 def quote_identifier(name: str) -> str:
@@ -70,6 +71,13 @@ def parse_args() -> argparse.Namespace:
         help="Rebuild heatmap data even if it already exists.",
     )
     return parser.parse_args()
+
+
+def normalize_cli_symbols(symbols: list[str]) -> list[str]:
+    cleaned = [symbol.strip().upper() for symbol in symbols if symbol.strip()]
+    if any(symbol == "RUN-ALL" for symbol in cleaned):
+        return []
+    return cleaned
 
 
 def ensure_engine_tables(conn: sqlite3.Connection) -> None:
@@ -250,24 +258,6 @@ def get_heatmap_covered_tables(conn: sqlite3.Connection) -> set[str]:
     return {row[0] for row in rows if row[0]}
 
 
-def detect_changed_tables(before: dict[str, dict[str, object]], after: dict[str, dict[str, object]]) -> list[str]:
-    changed = []
-    for table, after_state in after.items():
-        before_state = before.get(table)
-        if before_state is None:
-            changed.append(table)
-            continue
-        if after_state["row_count"] != before_state["row_count"]:
-            changed.append(table)
-            continue
-        if after_state["max_trade_date"] != before_state["max_trade_date"]:
-            changed.append(table)
-            continue
-        if after_state["null_rsi_count"] < before_state["null_rsi_count"]:
-            changed.append(table)
-    return changed
-
-
 def resolve_target_tables(conn: sqlite3.Connection, symbols: list[str]) -> list[str]:
     equity_tables = get_equity_tables(conn)
     if not symbols:
@@ -284,10 +274,25 @@ def resolve_target_tables(conn: sqlite3.Connection, symbols: list[str]) -> list[
     return resolved
 
 
+def describe_selected_tables(conn: sqlite3.Connection, symbols: list[str]) -> list[str]:
+    selected_tables = resolve_target_tables(conn, symbols)
+    if symbols:
+        return selected_tables
+
+    if not selected_tables:
+        print("No equity tables found in the database.")
+        return selected_tables
+
+    print(
+        "No symbols were provided, so the pipeline will process these equity tables: "
+        + ", ".join(selected_tables)
+    )
+    return selected_tables
+
+
 def get_tables_for_heatmap(
     conn: sqlite3.Connection,
     symbols: list[str],
-    changed_tables: list[str],
     force_heatmap: bool,
 ) -> list[str]:
     selected_tables = resolve_target_tables(conn, symbols)
@@ -295,53 +300,71 @@ def get_tables_for_heatmap(
         return selected_tables
 
     covered_tables = get_heatmap_covered_tables(conn)
-    missing_heatmap = [table for table in selected_tables if table not in covered_tables]
-    changed_selected = [table for table in selected_tables if table in set(changed_tables)]
+    return [table for table in selected_tables if table not in covered_tables]
 
-    ordered = []
-    seen = set()
-    for table in missing_heatmap + changed_selected:
-        if table not in seen:
-            ordered.append(table)
-            seen.add(table)
-    return ordered
+
+def describe_heatmap_selection(
+    conn: sqlite3.Connection,
+    symbols: list[str],
+    force_heatmap: bool,
+) -> list[str]:
+    selected_tables = resolve_target_tables(conn, symbols)
+
+    if force_heatmap:
+        if selected_tables:
+            print(
+                "Heatmap step will rebuild all selected tables: "
+                + ", ".join(selected_tables)
+            )
+        else:
+            print("Heatmap step will rebuild all selected tables: none")
+        return selected_tables
+
+    covered_tables = get_heatmap_covered_tables(conn)
+    heatmap_tables = get_tables_for_heatmap(conn, symbols, force_heatmap=False)
+    skipped_tables = [table for table in selected_tables if table in covered_tables]
+
+    if heatmap_tables:
+        print(
+            "Heatmap step will build: "
+            + ", ".join(heatmap_tables)
+        )
+    else:
+        print("Heatmap step will build: none")
+
+    if skipped_tables:
+        print(
+            "Heatmap step will skip existing rows for: "
+            + ", ".join(skipped_tables)
+        )
+
+    return heatmap_tables
 
 
 def main() -> None:
     args = parse_args()
-    symbol_args = [symbol.strip().upper() for symbol in args.symbols if symbol.strip()]
+    symbol_args = normalize_cli_symbols(args.symbols)
 
     run_conn = sqlite3.connect(DB_PATH)
     try:
         ensure_engine_tables(run_conn)
+        describe_selected_tables(run_conn, symbol_args)
         run_id = create_run(run_conn, symbol_args, args.force_heatmap)
 
         try:
             preflight_database(DB_PATH)
 
-            before_tables = resolve_target_tables(run_conn, symbol_args)
-            before_snapshot = get_table_snapshot(run_conn, before_tables)
-
             run_step(run_conn, run_id, "download", "download_indian_stock_history.py", symbol_args)
             run_step(run_conn, run_id, "ingest", "ingest_yfinance_to_sqlite.py", symbol_args)
             run_step(run_conn, run_id, "rsi_fill", "calculate_rsi_fill_db_frozen.py", symbol_args)
 
-            after_tables = resolve_target_tables(run_conn, symbol_args)
-            after_snapshot = get_table_snapshot(run_conn, after_tables)
-            changed_tables = detect_changed_tables(before_snapshot, after_snapshot)
-
-            heatmap_tables = get_tables_for_heatmap(
-                run_conn,
-                symbol_args,
-                changed_tables,
-                args.force_heatmap,
-            )
+            heatmap_tables = describe_heatmap_selection(run_conn, symbol_args, args.force_heatmap)
             if not heatmap_tables:
-                print("\n=== Heatmap step skipped: no missing or changed tables found ===")
+                print("\n=== Heatmap step skipped: no missing heatmap tables found ===")
             else:
                 for table in heatmap_tables:
                     heatmap_args = [table]
-                    if args.force_heatmap or table in changed_tables:
+                    if args.force_heatmap:
                         heatmap_args.append("--force")
                     run_step(run_conn, run_id, f"heatmap:{table}", "build_rsi_heatmap_table.py", heatmap_args)
 

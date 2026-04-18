@@ -97,6 +97,7 @@ Purpose:
 Purpose:
 - Downloads historical OHLCV data for Indian stocks using `yfinance`
 - Stores one CSV per stock in `historic_data/`
+- If no symbols are passed, it discovers all equity tables in SQLite and downloads for each one
 - If the equity table already exists in SQLite, it downloads only missing dates
 
 Usage:
@@ -105,6 +106,10 @@ Usage:
 py download_indian_stock_history.py
 py download_indian_stock_history.py TCS RELIANCE INFY
 ```
+
+Behavior:
+- No arguments: downloads for all equity tables found in `quant_historic_data.db`
+- System and utility tables are excluded automatically
 
 ### 2. `ingest_yfinance_to_sqlite.py`
 

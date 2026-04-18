@@ -26,7 +26,6 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "quant_historic_data.db"
 SIGNAL_ENGINE_PATH = BASE_DIR / "rsi_live_signal_engine.py"
 SIGNAL_LOG_TABLE = "rsi_live_signal_log"
-WATCHLIST_ENGINE_PATH = BASE_DIR / "quant_engine.py"
 API_KEY_HEADER_NAME = "X-API-Key"
 EXPECTED_API_KEY = os.getenv("QUANT_API_KEY", "").strip()
 ALLOWED_ORIGINS = [
@@ -47,32 +46,6 @@ run_signals_state: dict[str, object] = {
     "output": "",
     "error": None,
 }
-
-watchlist_lock = threading.Lock()
-
-watchlist_state: dict[str, object] = {
-    "status": "idle",
-    "symbols": [],
-    "run_all": False,
-    "started_at": None,
-    "finished_at": None,
-    "output": "",
-    "error": None,
-}
-SYSTEM_TABLES = {
-    "stocks_rsi_cagrs",
-    "market_data",
-    "sqlite_sequence",
-    "sqlite_stat1",
-    "sqlite_stat2",
-    "sqlite_stat3",
-    "sqlite_stat4",
-    SIGNAL_LOG_TABLE,
-    "rsi_heatmap_data",
-    "quant_engine_runs",
-    "quant_engine_steps",
-}
-EQUITY_REQUIRED_COLS = {"trade_date", "open", "high", "low", "close", "adj_close", "volume"}
 
 app.add_middleware(
     CORSMiddleware,
@@ -97,9 +70,6 @@ class SeedSignalRequest(BaseModel):
     ltp: float
     signal_timestamp: str | None = None
 
-class WatchlistRequest(BaseModel):
-    symbols: str  # space-separated string
-
 
 def quote_identifier(name: str) -> str:
     if not isinstance(name, str) or not name.strip():
@@ -119,26 +89,6 @@ def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
         (table_name,),
     ).fetchone()
     return row is not None
-
-
-def get_equity_tables(conn: sqlite3.Connection) -> list[str]:
-    rows = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
-    ).fetchall()
-
-    equity_tables: list[str] = []
-    for (name,) in rows:
-        if name in SYSTEM_TABLES:
-            continue
-
-        cols = {
-            row[1].lower()
-            for row in conn.execute(f"PRAGMA table_info({quote_identifier(name)})")
-        }
-        if EQUITY_REQUIRED_COLS.issubset(cols):
-            equity_tables.append(name)
-
-    return equity_tables
 
 
 def ensure_signal_log_table(conn: sqlite3.Connection) -> None:
@@ -188,41 +138,6 @@ def snapshot_run_state() -> dict[str, object]:
     with run_signals_lock:
         return dict(run_signals_state)
 
-def update_watchlist_state(**kwargs: object) -> None:
-    with watchlist_lock:
-        watchlist_state.update(kwargs)
-
-
-def snapshot_watchlist_state() -> dict[str, object]:
-    with watchlist_lock:
-        return dict(watchlist_state)
-
-
-def get_latest_quant_engine_run(conn: sqlite3.Connection) -> dict[str, object] | None:
-    if not table_exists(conn, "quant_engine_runs"):
-        return None
-
-    row = conn.execute(
-        """
-        SELECT run_id, started_at, finished_at, status, symbols, force_heatmap, error_message
-        FROM quant_engine_runs
-        ORDER BY run_id DESC
-        LIMIT 1
-        """
-    ).fetchone()
-    if row is None:
-        return None
-
-    return {
-        "run_id": row[0],
-        "started_at": row[1],
-        "finished_at": row[2],
-        "status": row[3],
-        "symbols": row[4].split(",") if row[4] else [],
-        "force_heatmap": bool(row[5]),
-        "error_message": row[6],
-    }
-
 
 def run_signal_engine_job(symbols: list[str], dry_run: bool) -> None:
     cmd = [sys.executable, str(SIGNAL_ENGINE_PATH)]
@@ -263,55 +178,6 @@ def run_signal_engine_job(symbols: list[str], dry_run: bool) -> None:
             finished_at=datetime.now().isoformat(timespec="seconds"),
             output="",
             error=detail or "Signal engine execution failed.",
-        )
-
-def run_watchlist_job(symbols: list[str], run_all: bool = False) -> None:
-    cmd = [sys.executable, str(WATCHLIST_ENGINE_PATH)]
-    if not run_all:
-        cmd.extend(symbols)
-
-    update_watchlist_state(
-        status="running",
-        symbols=symbols,
-        run_all=run_all,
-        started_at=datetime.now().isoformat(timespec="seconds"),
-        finished_at=None,
-        output="",
-        error=None,
-    )
-
-    try:
-        result = subprocess.run(
-            cmd,
-            cwd=str(BASE_DIR),
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-
-        output = "\n".join(
-            part for part in [result.stdout, result.stderr] if part
-        ).strip()
-
-        update_watchlist_state(
-            status="completed",
-            run_all=run_all,
-            finished_at=datetime.now().isoformat(timespec="seconds"),
-            output=output,
-            error=None,
-        )
-
-    except subprocess.CalledProcessError as exc:
-        error = "\n".join(
-            part for part in [exc.stdout, exc.stderr] if part
-        ).strip()
-
-        update_watchlist_state(
-            status="failed",
-            run_all=run_all,
-            finished_at=datetime.now().isoformat(timespec="seconds"),
-            output="",
-            error=error or "Execution failed",
         )
 
 
@@ -473,64 +339,3 @@ def seed_test_signal(
         "signal_type": signal_type,
         "signal_timestamp": timestamp,
     }
-
-@app.post("/add/watchlist")
-def add_watchlist(
-    request: WatchlistRequest,
-    x_api_key: str | None = Depends(api_key_header),
-) -> dict[str, object]:
-    validate_api_key(x_api_key)
-
-    raw_symbols = request.symbols.strip()
-    run_all = raw_symbols.upper() == "RUN-ALL"
-    if run_all:
-        symbols = []
-    else:
-        symbols = [s.strip().upper() for s in raw_symbols.split() if s.strip()]
-
-    if not symbols:
-        if raw_symbols.upper() != "RUN-ALL":
-            raise HTTPException(status_code=400, detail="No valid symbols provided.")
-
-    current_state = snapshot_watchlist_state()
-    if current_state["status"] == "running":
-        return {
-            "status": "already_running",
-            "symbols": current_state["symbols"],
-        }
-
-    worker = threading.Thread(
-        target=run_watchlist_job,
-        args=(symbols, run_all),
-        daemon=True,
-    )
-    worker.start()
-
-    return {
-        "status": "started",
-        "symbols": symbols,
-    }
-
-@app.get("/add/watchlist/status")
-def get_watchlist_status(
-    x_api_key: str | None = Depends(api_key_header),
-) -> dict[str, object]:
-    validate_api_key(x_api_key)
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        state = snapshot_watchlist_state()
-        state["equity_tables"] = get_equity_tables(conn)
-        latest_run = get_latest_quant_engine_run(conn)
-        if latest_run is not None:
-            state["engine_run"] = latest_run
-            if state["status"] != "running" or not state["symbols"]:
-                state["status"] = latest_run["status"]
-                state["started_at"] = latest_run["started_at"]
-                state["finished_at"] = latest_run["finished_at"]
-                state["error"] = latest_run["error_message"]
-                state["output"] = latest_run["error_message"] or state["output"]
-                state["symbols"] = latest_run["symbols"] or get_equity_tables(conn)
-                state["run_all"] = not bool(latest_run["symbols"])
-        return state
-    finally:
-        conn.close()

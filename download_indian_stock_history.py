@@ -2,10 +2,11 @@
 """
 Download historic OHLCV data for Indian stocks and save one CSV per symbol.
 
-Update STOCK_SYMBOLS with the stocks you want to download, then run:
-    py download_indian_stock_history.py
+If no symbols are provided on the command line, the script discovers all
+equity tables in the SQLite database and downloads data for each one.
 
-Optional:
+Examples:
+    py download_indian_stock_history.py
     py download_indian_stock_history.py TCS RELIANCE INFY
 """
 
@@ -13,7 +14,7 @@ from __future__ import annotations
 
 import argparse
 import sqlite3
-from datetime import timedelta
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -26,17 +27,27 @@ except ImportError as exc:
     ) from exc
 
 
-STOCK_SYMBOLS = [
-    "TCS",
-    "RELIANCE",
-    "INFY",
-]
-
 START_DATE = "2023-01-01"
 END_DATE = None
 INTERVAL = "1d"
 OUTPUT_DIR = Path(__file__).resolve().parent / "historic_data"
 DB_NAME = Path(__file__).resolve().parent / "quant_historic_data.db"
+IST = timezone(timedelta(hours=5, minutes=30))
+EQUITY_CUTOFF_IST = time(hour=16, minute=0)
+SYSTEM_TABLES = {
+    "stocks_rsi_cagrs",
+    "market_data",
+    "sqlite_sequence",
+    "sqlite_stat1",
+    "sqlite_stat2",
+    "sqlite_stat3",
+    "sqlite_stat4",
+    "rsi_heatmap_data",
+    "rsi_live_signal_log",
+    "quant_engine_runs",
+    "quant_engine_steps",
+}
+EQUITY_REQUIRED_COLS = {"trade_date", "open", "high", "low", "close", "adj_close", "volume"}
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -58,6 +69,26 @@ def quote_identifier(name: str) -> str:
     if "\x00" in name:
         raise ValueError("Identifier contains an invalid null byte.")
     return '"' + name.replace('"', '""') + '"'
+
+
+def get_equity_tables(conn: sqlite3.Connection) -> list[str]:
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+    ).fetchall()
+
+    equity_tables: list[str] = []
+    for (name,) in rows:
+        if name in SYSTEM_TABLES:
+            continue
+
+        cols = {
+            row[1].lower()
+            for row in conn.execute(f"PRAGMA table_info({quote_identifier(name)})")
+        }
+        if EQUITY_REQUIRED_COLS.issubset(cols):
+            equity_tables.append(name)
+
+    return equity_tables
 
 
 def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
@@ -206,17 +237,40 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def is_before_equity_cutoff_ist() -> tuple[bool, datetime, datetime]:
+    now_ist = datetime.now(IST)
+    cutoff_ist = datetime.combine(now_ist.date(), EQUITY_CUTOFF_IST, tzinfo=IST)
+    return now_ist < cutoff_ist, now_ist, cutoff_ist
+
+
 def main() -> None:
     args = parse_args()
-    raw_symbols = args.symbols or STOCK_SYMBOLS
 
-    if not raw_symbols:
-        raise SystemExit("Provide at least one stock symbol in STOCK_SYMBOLS or via CLI.")
+    before_cutoff, now_ist, cutoff_ist = is_before_equity_cutoff_ist()
+    if before_cutoff:
+        print(
+            "Today's cutoff time not reached. "
+            f"Current IST time: {now_ist.strftime('%Y-%m-%d %H:%M:%S')}. "
+            f"Cutoff IST: {cutoff_ist.strftime('%Y-%m-%d %H:%M:%S')}."
+        )
+        return
 
     output_dir = Path(args.output_dir).resolve()
     conn = sqlite3.connect(DB_NAME)
 
     try:
+        raw_symbols = args.symbols
+        if not raw_symbols:
+            raw_symbols = get_equity_tables(conn)
+            if not raw_symbols:
+                raise SystemExit(
+                    "No equity tables found in the database. Provide symbols on the CLI or create equity tables first."
+                )
+            print(
+                "No symbols were provided, so using all equity tables from the database: "
+                + ", ".join(raw_symbols)
+            )
+
         for raw_symbol in raw_symbols:
             try:
                 symbol = normalize_symbol(raw_symbol)
