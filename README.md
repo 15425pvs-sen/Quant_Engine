@@ -94,7 +94,8 @@ Purpose:
 1. Run uvicorn signal_api:app --host 0.0.0.0 --port 8000
 2. Run ngrok http 8000
 3. Then at path D:\QuantApplication\Database_Quant, run script "py quant_engine.py". This will download all the historical stock data along with RSI values & fill in the DB.
-4. Then open StratEdge application and run "Refresh Signals".
+4. Then run py rsi_live_signal_engine.py --check-latest-rsi or py rsi_live_signal_engine.py RELIANCE --check-latest-rsi.
+5. Then open StratEdge application and run "Refresh Signals".
 
 ## Scripts
 

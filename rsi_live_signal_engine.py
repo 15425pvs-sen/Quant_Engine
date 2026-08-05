@@ -80,6 +80,14 @@ def parse_args() -> argparse.Namespace:
             "computing a live RSI from yfinance."
         ),
     )
+    parser.add_argument(
+        "--check-latest-rsi",
+        action="store_true",
+        help=(
+            "Use only the latest stored RSI value from each equity table and "
+            "compare it directly to RSI heatmap buckets."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -194,6 +202,86 @@ def has_sell_for_buy(conn: sqlite3.Connection, buy_signal_id: int) -> bool:
         (buy_signal_id,),
     ).fetchone()
     return row is not None
+
+
+def has_signal_bucket(
+    conn: sqlite3.Connection,
+    source_table: str,
+    signal_type: str,
+    entry_rsi: int,
+    exit_rsi: int,
+) -> bool:
+    row = conn.execute(
+        f"""
+        SELECT 1
+        FROM {quote_identifier(SIGNAL_LOG_TABLE)}
+        WHERE source_table = ?
+          AND signal_type = ?
+          AND entry_rsi = ?
+          AND exit_rsi = ?
+        LIMIT 1
+        """,
+        (source_table, signal_type, entry_rsi, exit_rsi),
+    ).fetchone()
+    return row is not None
+
+
+def load_latest_rsi_snapshot(
+    conn: sqlite3.Connection,
+    table_name: str,
+) -> tuple[float | None, float | None, str | None]:
+    df = pd.read_sql(
+        f"""
+        SELECT trade_date, close, rsi
+        FROM {quote_identifier(table_name)}
+        WHERE close IS NOT NULL AND rsi IS NOT NULL
+        ORDER BY trade_date DESC
+        LIMIT 1
+        """,
+        conn,
+    )
+
+    if df.empty:
+        return None, None, None
+
+    df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
+    df["close"] = pd.to_numeric(
+        df["close"].astype(str).str.replace(",", "", regex=False).str.strip(),
+        errors="coerce",
+    )
+    df["rsi"] = pd.to_numeric(
+        df["rsi"].astype(str).str.replace(",", "", regex=False).str.strip(),
+        errors="coerce",
+    )
+    df = df.dropna(subset=["trade_date", "close", "rsi"]).reset_index(drop=True)
+    if df.empty:
+        return None, None, None
+
+    current_rsi = round(float(df.iloc[0]["rsi"]), 2)
+    ltp = round(float(df.iloc[0]["close"]), 2)
+    signal_date = pd.Timestamp(df.iloc[0]["trade_date"]).strftime("%Y-%m-%d")
+    return current_rsi, ltp, signal_date
+
+
+def get_buy_signal_reason_latest_rsi(
+    current_rsi: float,
+    entry_rsi: int,
+    exit_rsi: int,
+) -> str | None:
+    if current_rsi < entry_rsi or current_rsi >= exit_rsi:
+        return None
+
+    return "Latest RSI hit the entry bucket for this stock."
+
+
+def get_sell_signal_reason_latest_rsi(
+    current_rsi: float,
+    exit_rsi: int,
+) -> str | None:
+    if current_rsi < exit_rsi:
+        return None
+
+    return "Latest RSI hit the exit bucket for this stock."
 
 
 def get_buy_signal_reason(
@@ -485,13 +573,26 @@ def build_signal_rows(
     heatmap_df: pd.DataFrame,
     ltps: dict[str, float],
     check_last_rsi: bool = False,
+    check_latest_rsi: bool = False,
 ) -> list[dict[str, object]]:
     signal_rows: list[dict[str, object]] = []
     runtime_timestamp = datetime.now().isoformat(timespec="seconds")
     runtime_date = datetime.now().date().isoformat()
 
     for source_table, stock_rules in heatmap_df.groupby("source_table"):
-        if check_last_rsi:
+        if check_latest_rsi:
+            current_rsi, ltp, signal_date = load_latest_rsi_snapshot(conn, source_table)
+            signal_timestamp = (
+                f"{signal_date}T15:30:00" if signal_date is not None else runtime_timestamp
+            )
+            if current_rsi is None or ltp is None or signal_date is None:
+                print(f"Skipping {source_table}: unable to read the latest stored RSI row.")
+                continue
+            previous_rsi = current_rsi
+            print(
+                f"{source_table}: mode=latest_rsi, close={ltp:.2f}, current_RSI={current_rsi:.2f}"
+            )
+        elif check_last_rsi:
             previous_rsi, current_rsi, ltp, signal_date = load_last_rsi_snapshot(conn, source_table)
             signal_timestamp = (
                 f"{signal_date}T15:30:00" if signal_date is not None else runtime_timestamp
@@ -520,25 +621,30 @@ def build_signal_rows(
                 f"{source_table}: mode=live, LTP={ltp:.2f}, previous_RSI={previous_rsi:.2f}, current_RSI={current_rsi:.2f}"
             )
 
-        # When multiple buckets share the same entry RSI, prefer the historically
-        # strongest return profile first so the best BUY bucket is emitted first.
         ranked_rules = stock_rules.sort_values(
             by=["entry_rsi", "avg_return_pct", "trades", "exit_rsi"],
             ascending=[True, False, False, True],
         )
 
-        for _, rule in ranked_rules.iterrows():
-            entry_rsi = int(rule["entry_rsi"])
-            exit_rsi = int(rule["exit_rsi"])
-            buy_reason = get_buy_signal_reason(
-                previous_rsi,
-                current_rsi,
-                entry_rsi,
-                exit_rsi,
-                check_last_rsi,
-            )
+        if check_latest_rsi:
+            buy_candidates: list[tuple[int, int, pd.Series]] = []
+            for _, rule in ranked_rules.iterrows():
+                entry_rsi = int(rule["entry_rsi"])
+                exit_rsi = int(rule["exit_rsi"])
+                buy_reason = get_buy_signal_reason_latest_rsi(current_rsi, entry_rsi, exit_rsi)
+                if not buy_reason:
+                    continue
 
-            if buy_reason and not has_open_buy_bucket(conn, source_table, entry_rsi, exit_rsi):
+                if has_signal_bucket(conn, source_table, "BUY", entry_rsi, exit_rsi):
+                    continue
+
+                buy_candidates.append((exit_rsi, -entry_rsi, rule))
+
+            if buy_candidates:
+                _, _, selected_rule = min(buy_candidates)
+                entry_rsi = int(selected_rule["entry_rsi"])
+                exit_rsi = int(selected_rule["exit_rsi"])
+                buy_reason = get_buy_signal_reason_latest_rsi(current_rsi, entry_rsi, exit_rsi)
                 signal_rows.append(
                     {
                         "source_table": source_table,
@@ -562,17 +668,64 @@ def build_signal_rows(
                     f"BUY  {source_table}  bucket=({entry_rsi},{exit_rsi})  "
                     f"RSI {previous_rsi:.2f}->{current_rsi:.2f}  reason={buy_reason}"
                 )
+        else:
+            for _, rule in ranked_rules.iterrows():
+                entry_rsi = int(rule["entry_rsi"])
+                exit_rsi = int(rule["exit_rsi"])
+                buy_reason = get_buy_signal_reason(
+                    previous_rsi,
+                    current_rsi,
+                    entry_rsi,
+                    exit_rsi,
+                    check_last_rsi,
+                )
+
+                if buy_reason:
+                    already_logged = has_open_buy_bucket(conn, source_table, entry_rsi, exit_rsi)
+                    if not already_logged:
+                        signal_rows.append(
+                            {
+                                "source_table": source_table,
+                                "signal_type": "BUY",
+                                "entry_rsi": entry_rsi,
+                                "exit_rsi": exit_rsi,
+                                "previous_rsi": previous_rsi,
+                                "current_rsi": current_rsi,
+                                "ltp": round(float(ltp), 2),
+                                "signal_date": signal_date,
+                                "signal_timestamp": signal_timestamp,
+                                "position_state": BUY_OPEN_STATE,
+                                "buy_signal_id": None,
+                                "trigger_exit_rsi": None,
+                                "action_timestamp": None,
+                                "closed_by_signal_id": None,
+                                "notes": buy_reason,
+                            }
+                        )
+                        print(
+                            f"BUY  {source_table}  bucket=({entry_rsi},{exit_rsi})  "
+                            f"RSI {previous_rsi:.2f}->{current_rsi:.2f}  reason={buy_reason}"
+                        )
 
         for buy_signal_id, buy_entry_rsi, buy_exit_rsi in get_open_buy_rows(conn, source_table):
             if has_sell_for_buy(conn, buy_signal_id):
                 continue
-            sell_reason = get_sell_signal_reason(
-                previous_rsi,
-                current_rsi,
-                buy_exit_rsi,
-                check_last_rsi,
-            )
+            if check_latest_rsi:
+                sell_reason = get_sell_signal_reason_latest_rsi(current_rsi, buy_exit_rsi)
+            else:
+                sell_reason = get_sell_signal_reason(
+                    previous_rsi,
+                    current_rsi,
+                    buy_exit_rsi,
+                    check_last_rsi,
+                )
+
             if sell_reason is None:
+                continue
+
+            if check_latest_rsi and has_signal_bucket(
+                conn, source_table, "SELL", buy_entry_rsi, buy_exit_rsi
+            ):
                 continue
 
             signal_rows.append(
@@ -684,7 +837,7 @@ def main() -> None:
 
         symbols = sorted(heatmap_df["source_table"].dropna().unique().tolist())
         ltps: dict[str, float] = {}
-        if not args.check_last_rsi:
+        if not args.check_last_rsi and not args.check_latest_rsi:
             ltps = fetch_ltps(symbols)
             if not ltps:
                 print("No live prices could be fetched.")
@@ -695,6 +848,7 @@ def main() -> None:
             heatmap_df,
             ltps,
             check_last_rsi=args.check_last_rsi,
+            check_latest_rsi=args.check_latest_rsi,
         )
         if not signal_rows:
             print("No BUY/SELL signals generated.")
