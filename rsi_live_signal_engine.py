@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 """
 Fetch live prices for stocks present in rsi_heatmap_data, compute a live RSI,
-and generate BUY/SELL signals when the RSI crosses configured entry/exit levels.
+and generate BUY/SELL signals when the RSI crosses configured entry/exit levels
+or remains within a small grace window above the BUY entry bucket.
 
 Signals are logged to SQLite and duplicate calls are suppressed per
 (stock, entry_rsi, exit_rsi) bucket by checking the latest signal state.
@@ -38,6 +39,15 @@ RSI_PERIOD = 14
 LTP_HISTORY_PERIOD = "5d"
 LTP_INTERVAL = "1m"
 RSI_BUFFER_ROWS = 100
+MIN_RULE_AVG_RETURN_PCT = 2.5
+MIN_RULE_TRADES = 5
+MIN_RULE_WIN_RATE_PCT = 50.0
+MAX_RULE_WORST_LOSS_PCT = -15.0
+BUY_ENTRY_RETRY_WINDOW = 2.0
+SELL_EXIT_RETRY_WINDOW = 2.0
+BUY_OPEN_STATE = "OPEN"
+BUY_CLOSED_STATE = "CLOSED"
+SELL_CONFIRMED_STATE = "CONFIRMED"
 
 
 def quote_identifier(name: str) -> str:
@@ -87,7 +97,12 @@ def ensure_signal_log_table(conn: sqlite3.Connection) -> None:
             ltp               REAL NOT NULL,
             signal_date       TEXT NOT NULL,
             signal_timestamp  TEXT NOT NULL,
-            notes             TEXT
+            notes             TEXT,
+            position_state    TEXT NOT NULL DEFAULT 'OPEN',
+            buy_signal_id     INTEGER,
+            trigger_exit_rsi  INTEGER,
+            action_timestamp  TEXT,
+            closed_by_signal_id INTEGER
         )
         """
     )
@@ -97,12 +112,152 @@ def ensure_signal_log_table(conn: sqlite3.Connection) -> None:
         ON {quote_identifier(SIGNAL_LOG_TABLE)} (source_table, entry_rsi, exit_rsi, signal_timestamp)
         """
     )
+    existing_cols = {
+        row[1].lower()
+        for row in conn.execute(f"PRAGMA table_info({quote_identifier(SIGNAL_LOG_TABLE)})")
+    }
+    if "position_state" not in existing_cols:
+        conn.execute(
+            f"ALTER TABLE {quote_identifier(SIGNAL_LOG_TABLE)} "
+            "ADD COLUMN position_state TEXT NOT NULL DEFAULT 'OPEN'"
+        )
+    if "buy_signal_id" not in existing_cols:
+        conn.execute(
+            f"ALTER TABLE {quote_identifier(SIGNAL_LOG_TABLE)} "
+            "ADD COLUMN buy_signal_id INTEGER"
+        )
+    if "trigger_exit_rsi" not in existing_cols:
+        conn.execute(
+            f"ALTER TABLE {quote_identifier(SIGNAL_LOG_TABLE)} "
+            "ADD COLUMN trigger_exit_rsi INTEGER"
+        )
+    if "action_timestamp" not in existing_cols:
+        conn.execute(
+            f"ALTER TABLE {quote_identifier(SIGNAL_LOG_TABLE)} "
+            "ADD COLUMN action_timestamp TEXT"
+        )
+    if "closed_by_signal_id" not in existing_cols:
+        conn.execute(
+            f"ALTER TABLE {quote_identifier(SIGNAL_LOG_TABLE)} "
+            "ADD COLUMN closed_by_signal_id INTEGER"
+        )
     conn.commit()
+
+
+def has_open_buy_bucket(
+    conn: sqlite3.Connection,
+    source_table: str,
+    entry_rsi: int,
+    exit_rsi: int,
+) -> bool:
+    row = conn.execute(
+        f"""
+        SELECT 1
+        FROM {quote_identifier(SIGNAL_LOG_TABLE)}
+        WHERE source_table = ?
+          AND signal_type = 'BUY'
+          AND entry_rsi = ?
+          AND exit_rsi = ?
+          AND COALESCE(position_state, '{BUY_OPEN_STATE}') = '{BUY_OPEN_STATE}'
+        LIMIT 1
+        """,
+        (source_table, entry_rsi, exit_rsi),
+    ).fetchone()
+    return row is not None
+
+
+def get_open_buy_rows(conn: sqlite3.Connection, source_table: str) -> list[tuple[int, int, int]]:
+    rows = conn.execute(
+        f"""
+        SELECT id, entry_rsi, exit_rsi
+        FROM {quote_identifier(SIGNAL_LOG_TABLE)}
+        WHERE source_table = ?
+          AND signal_type = 'BUY'
+          AND COALESCE(position_state, '{BUY_OPEN_STATE}') = '{BUY_OPEN_STATE}'
+        ORDER BY signal_timestamp ASC, id ASC
+        """,
+        (source_table,),
+    ).fetchall()
+    return [(int(row[0]), int(row[1]), int(row[2])) for row in rows]
+
+
+def has_sell_for_buy(conn: sqlite3.Connection, buy_signal_id: int) -> bool:
+    row = conn.execute(
+        f"""
+        SELECT 1
+        FROM {quote_identifier(SIGNAL_LOG_TABLE)}
+        WHERE signal_type = 'SELL'
+          AND buy_signal_id = ?
+          AND COALESCE(position_state, '{SELL_CONFIRMED_STATE}') IN ('CONFIRMED', 'PENDING')
+        LIMIT 1
+        """,
+        (buy_signal_id,),
+    ).fetchone()
+    return row is not None
+
+
+def get_buy_signal_reason(
+    previous_rsi: float,
+    current_rsi: float,
+    entry_rsi: int,
+    exit_rsi: int,
+    check_last_rsi: bool,
+) -> str | None:
+    if current_rsi >= exit_rsi:
+        return None
+
+    if previous_rsi < entry_rsi <= current_rsi:
+        return (
+            "Entry RSI crossover detected from last stored RSI rows."
+            if check_last_rsi
+            else "Entry RSI crossover detected from live price."
+        )
+
+    recovery_upper = entry_rsi + BUY_ENTRY_RETRY_WINDOW
+    if entry_rsi < current_rsi <= recovery_upper:
+        return (
+            f"Recovery BUY detected within {BUY_ENTRY_RETRY_WINDOW:.0f} RSI point grace window above entry."
+            if check_last_rsi
+            else f"Recovery BUY detected within {BUY_ENTRY_RETRY_WINDOW:.0f} RSI point grace window above entry."
+        )
+
+    return None
+
+
+def get_sell_signal_reason(
+    previous_rsi: float,
+    current_rsi: float,
+    exit_rsi: int,
+    check_last_rsi: bool,
+) -> str | None:
+    if previous_rsi < exit_rsi <= current_rsi:
+        return (
+            "Exit RSI crossover detected from last stored RSI rows."
+            if check_last_rsi
+            else "Exit RSI crossover detected from live price."
+        )
+
+    recovery_upper = exit_rsi + SELL_EXIT_RETRY_WINDOW
+    if exit_rsi < current_rsi <= recovery_upper:
+        return (
+            f"Recovery SELL detected within {SELL_EXIT_RETRY_WINDOW:.0f} RSI point grace window above exit."
+            if check_last_rsi
+            else f"Recovery SELL detected within {SELL_EXIT_RETRY_WINDOW:.0f} RSI point grace window above exit."
+        )
+
+    return None
 
 
 def get_heatmap_rows(conn: sqlite3.Connection, symbols: list[str]) -> pd.DataFrame:
     query = f"""
-        SELECT source_table, entry_rsi, exit_rsi, avg_return_pct, trades, win_rate_pct
+        SELECT
+            source_table,
+            entry_rsi,
+            exit_rsi,
+            avg_return_pct,
+            trades,
+            win_rate_pct,
+            min_return_pct
         FROM {quote_identifier(HEATMAP_TABLE)}
     """
     df = pd.read_sql(query, conn)
@@ -116,8 +271,41 @@ def get_heatmap_rows(conn: sqlite3.Connection, symbols: list[str]) -> pd.DataFra
 
     for col in ("entry_rsi", "exit_rsi"):
         df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
+    for col in ("avg_return_pct", "trades", "win_rate_pct", "min_return_pct"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df = df.dropna(subset=["source_table", "entry_rsi", "exit_rsi"]).reset_index(drop=True)
+    df = df.dropna(
+        subset=[
+            "source_table",
+            "entry_rsi",
+            "exit_rsi",
+            "avg_return_pct",
+            "trades",
+            "win_rate_pct",
+            "min_return_pct",
+        ]
+    ).reset_index(drop=True)
+
+    initial_count = len(df)
+    df = df[
+        (df["avg_return_pct"] >= MIN_RULE_AVG_RETURN_PCT)
+        & (df["trades"] >= MIN_RULE_TRADES)
+        & (df["win_rate_pct"] >= MIN_RULE_WIN_RATE_PCT)
+        & (df["min_return_pct"] >= MAX_RULE_WORST_LOSS_PCT)
+    ].reset_index(drop=True)
+    filtered_count = initial_count - len(df)
+    if filtered_count > 0:
+        print(
+            f"Filtered {filtered_count} low-quality heatmap row(s) "
+            f"(avg>={MIN_RULE_AVG_RETURN_PCT:.1f}, trades>={MIN_RULE_TRADES}, "
+            f"win_rate>={MIN_RULE_WIN_RATE_PCT:.1f}, min_return>={MAX_RULE_WORST_LOSS_PCT:.1f})."
+        )
+
+    if not df.empty:
+        df = df.sort_values(
+            by=["source_table", "avg_return_pct", "win_rate_pct", "trades", "min_return_pct"],
+            ascending=[True, False, False, False, False],
+        ).reset_index(drop=True)
     return df
 
 
@@ -292,25 +480,6 @@ def compute_live_rsi(history_df: pd.DataFrame, ltp: float) -> tuple[float | None
     return previous_rsi, round(float(current_rsi), 2)
 
 
-def get_last_signal_type(
-    conn: sqlite3.Connection,
-    source_table: str,
-    entry_rsi: int,
-    exit_rsi: int,
-) -> str | None:
-    row = conn.execute(
-        f"""
-        SELECT signal_type
-        FROM {quote_identifier(SIGNAL_LOG_TABLE)}
-        WHERE source_table = ? AND entry_rsi = ? AND exit_rsi = ?
-        ORDER BY signal_timestamp DESC, id DESC
-        LIMIT 1
-        """,
-        (source_table, entry_rsi, exit_rsi),
-    ).fetchone()
-    return row[0] if row else None
-
-
 def build_signal_rows(
     conn: sqlite3.Connection,
     heatmap_df: pd.DataFrame,
@@ -361,13 +530,15 @@ def build_signal_rows(
         for _, rule in ranked_rules.iterrows():
             entry_rsi = int(rule["entry_rsi"])
             exit_rsi = int(rule["exit_rsi"])
-            last_signal_type = get_last_signal_type(conn, source_table, entry_rsi, exit_rsi)
-            in_position = last_signal_type == "BUY"
+            buy_reason = get_buy_signal_reason(
+                previous_rsi,
+                current_rsi,
+                entry_rsi,
+                exit_rsi,
+                check_last_rsi,
+            )
 
-            entry_crossed = previous_rsi < entry_rsi <= current_rsi
-            exit_crossed = previous_rsi < exit_rsi <= current_rsi
-
-            if not in_position and entry_crossed and current_rsi < exit_rsi:
+            if buy_reason and not has_open_buy_bucket(conn, source_table, entry_rsi, exit_rsi):
                 signal_rows.append(
                     {
                         "source_table": source_table,
@@ -379,41 +550,54 @@ def build_signal_rows(
                         "ltp": round(float(ltp), 2),
                         "signal_date": signal_date,
                         "signal_timestamp": signal_timestamp,
-                        "notes": (
-                            "Entry RSI crossover detected from last stored RSI rows."
-                            if check_last_rsi
-                            else "Entry RSI crossover detected from live price."
-                        ),
+                        "position_state": BUY_OPEN_STATE,
+                        "buy_signal_id": None,
+                        "trigger_exit_rsi": None,
+                        "action_timestamp": None,
+                        "closed_by_signal_id": None,
+                        "notes": buy_reason,
                     }
                 )
                 print(
                     f"BUY  {source_table}  bucket=({entry_rsi},{exit_rsi})  "
-                    f"RSI {previous_rsi:.2f}->{current_rsi:.2f}"
+                    f"RSI {previous_rsi:.2f}->{current_rsi:.2f}  reason={buy_reason}"
                 )
 
-            elif in_position and exit_crossed:
-                signal_rows.append(
-                    {
-                        "source_table": source_table,
-                        "signal_type": "SELL",
-                        "entry_rsi": entry_rsi,
-                        "exit_rsi": exit_rsi,
-                        "previous_rsi": previous_rsi,
-                        "current_rsi": current_rsi,
-                        "ltp": round(float(ltp), 2),
-                        "signal_date": signal_date,
-                        "signal_timestamp": signal_timestamp,
-                        "notes": (
-                            "Exit RSI crossover detected from last stored RSI rows."
-                            if check_last_rsi
-                            else "Exit RSI crossover detected from live price."
-                        ),
-                    }
-                )
-                print(
-                    f"SELL {source_table}  bucket=({entry_rsi},{exit_rsi})  "
-                    f"RSI {previous_rsi:.2f}->{current_rsi:.2f}"
-                )
+        for buy_signal_id, buy_entry_rsi, buy_exit_rsi in get_open_buy_rows(conn, source_table):
+            if has_sell_for_buy(conn, buy_signal_id):
+                continue
+            sell_reason = get_sell_signal_reason(
+                previous_rsi,
+                current_rsi,
+                buy_exit_rsi,
+                check_last_rsi,
+            )
+            if sell_reason is None:
+                continue
+
+            signal_rows.append(
+                {
+                    "source_table": source_table,
+                    "signal_type": "SELL",
+                    "entry_rsi": buy_entry_rsi,
+                    "exit_rsi": buy_exit_rsi,
+                    "previous_rsi": previous_rsi,
+                    "current_rsi": current_rsi,
+                    "ltp": round(float(ltp), 2),
+                    "signal_date": signal_date,
+                    "signal_timestamp": signal_timestamp,
+                    "position_state": SELL_CONFIRMED_STATE,
+                    "buy_signal_id": buy_signal_id,
+                    "trigger_exit_rsi": buy_exit_rsi,
+                    "action_timestamp": signal_timestamp,
+                    "closed_by_signal_id": None,
+                    "notes": f"{sell_reason} trigger_exit_rsi={buy_exit_rsi}.",
+                }
+            )
+            print(
+                f"SELL {source_table}  buy_id={buy_signal_id} bucket=({buy_entry_rsi},{buy_exit_rsi})  "
+                f"trigger_exit={buy_exit_rsi}  RSI {previous_rsi:.2f}->{current_rsi:.2f}  reason={sell_reason}"
+            )
 
     return signal_rows
 
@@ -422,23 +606,29 @@ def insert_signal_rows(conn: sqlite3.Connection, signal_rows: list[dict[str, obj
     if not signal_rows:
         return 0
 
-    conn.executemany(
-        f"""
-        INSERT INTO {quote_identifier(SIGNAL_LOG_TABLE)} (
-            source_table,
-            signal_type,
-            entry_rsi,
-            exit_rsi,
-            previous_rsi,
-            current_rsi,
-            ltp,
-            signal_date,
-            signal_timestamp,
-            notes
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        [
+    inserted = 0
+    for row in signal_rows:
+        cursor = conn.execute(
+            f"""
+            INSERT INTO {quote_identifier(SIGNAL_LOG_TABLE)} (
+                source_table,
+                signal_type,
+                entry_rsi,
+                exit_rsi,
+                previous_rsi,
+                current_rsi,
+                ltp,
+                signal_date,
+                signal_timestamp,
+                notes,
+                position_state,
+                buy_signal_id,
+                trigger_exit_rsi,
+                action_timestamp,
+                closed_by_signal_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             (
                 row["source_table"],
                 row["signal_type"],
@@ -450,12 +640,34 @@ def insert_signal_rows(conn: sqlite3.Connection, signal_rows: list[dict[str, obj
                 row["signal_date"],
                 row["signal_timestamp"],
                 row["notes"],
+                row["position_state"],
+                row["buy_signal_id"],
+                row["trigger_exit_rsi"],
+                row["action_timestamp"],
+                row["closed_by_signal_id"],
+            ),
+        )
+        inserted += 1
+
+        if row["signal_type"] == "SELL" and row["buy_signal_id"] is not None:
+            conn.execute(
+                f"""
+                UPDATE {quote_identifier(SIGNAL_LOG_TABLE)}
+                SET position_state = ?, action_timestamp = ?, closed_by_signal_id = ?
+                WHERE id = ?
+                  AND signal_type = 'BUY'
+                  AND COALESCE(position_state, '{BUY_OPEN_STATE}') = '{BUY_OPEN_STATE}'
+                """,
+                (
+                    BUY_CLOSED_STATE,
+                    row["signal_timestamp"],
+                    int(cursor.lastrowid),
+                    int(row["buy_signal_id"]),
+                ),
             )
-            for row in signal_rows
-        ],
-    )
+
     conn.commit()
-    return len(signal_rows)
+    return inserted
 
 
 def main() -> None:

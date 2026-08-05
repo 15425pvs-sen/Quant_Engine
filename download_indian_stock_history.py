@@ -243,17 +243,57 @@ def is_before_equity_cutoff_ist() -> tuple[bool, datetime, datetime]:
     return now_ist < cutoff_ist, now_ist, cutoff_ist
 
 
+def compute_effective_end_date(
+    start: str,
+    requested_end: str | None,
+    before_cutoff: bool,
+    now_ist: datetime,
+) -> tuple[str | None, bool, bool]:
+    start_date = pd.to_datetime(start, errors="coerce")
+    if pd.isna(start_date):
+        return requested_end, False, True
+
+    start_date = start_date.normalize()
+    today_ist = pd.Timestamp(now_ist.date())
+
+    requested_end_date: pd.Timestamp | None = None
+    if requested_end:
+        requested_end_date = pd.to_datetime(requested_end, errors="coerce")
+        if not pd.isna(requested_end_date):
+            requested_end_date = requested_end_date.normalize()
+        else:
+            requested_end_date = None
+
+    effective_end_date = requested_end_date
+    deferred_today = False
+
+    # yfinance "end" is exclusive. Before the cutoff, force "end=today"
+    # so historical backfills still run while today's candle is deferred.
+    if before_cutoff and (effective_end_date is None or effective_end_date > today_ist):
+        effective_end_date = today_ist
+        deferred_today = True
+
+    if effective_end_date is not None and start_date >= effective_end_date:
+        return None, deferred_today, False
+
+    return (
+        effective_end_date.strftime("%Y-%m-%d") if effective_end_date is not None else requested_end,
+        deferred_today,
+        True,
+    )
+
+
 def main() -> None:
     args = parse_args()
 
     before_cutoff, now_ist, cutoff_ist = is_before_equity_cutoff_ist()
     if before_cutoff:
         print(
-            "Today's cutoff time not reached. "
+            "Current IST time is before equity cutoff; historical missing dates will still download, "
+            "but today's data will be skipped until cutoff. "
             f"Current IST time: {now_ist.strftime('%Y-%m-%d %H:%M:%S')}. "
             f"Cutoff IST: {cutoff_ist.strftime('%Y-%m-%d %H:%M:%S')}."
         )
-        return
 
     output_dir = Path(args.output_dir).resolve()
     conn = sqlite3.connect(DB_NAME)
@@ -292,7 +332,25 @@ def main() -> None:
                     f"from {download_start} after {latest_trade_date.date()}..."
                 )
 
-            df = download_symbol_data(symbol, download_start, args.end, args.interval)
+            effective_end, deferred_today, has_valid_range = compute_effective_end_date(
+                start=download_start,
+                requested_end=args.end,
+                before_cutoff=before_cutoff,
+                now_ist=now_ist,
+            )
+            if not has_valid_range:
+                if deferred_today:
+                    print(
+                        f"Skipping {symbol}: only current date data is pending and cutoff is at "
+                        f"{cutoff_ist.strftime('%Y-%m-%d %H:%M:%S')} IST."
+                    )
+                else:
+                    print(
+                        f"Skipping {symbol}: no valid download range for start={download_start} and end={args.end}."
+                    )
+                continue
+
+            df = download_symbol_data(symbol, download_start, effective_end, args.interval)
 
             if df.empty:
                 print(f"No new data returned for {symbol}.")

@@ -30,7 +30,7 @@ DEFAULT_OUTPUT_TABLE = "rsi_heatmap_data"
 REQUIRED_SOURCE_COLUMNS = {"trade_date", "close", "rsi"}
 
 ENTRY_START = 20
-ENTRY_END = 50
+ENTRY_END = 65
 ENTRY_STEP = 5
 
 EXIT_START_GAP = 5
@@ -40,7 +40,10 @@ EXIT_STEP = 6
 MIN_TRADES = 4
 USE_STOP_LOSS = True
 STOP_LOSS_PCT = -0.12
-MIN_AVG_RETURN_PCT = 5.0
+MIN_AVG_RETURN_PCT = 2.5
+MIN_WIN_RATE_PCT = 50.0
+MAX_ACCEPTABLE_LOSS_PCT = -15.0
+MAX_RULES_PER_TABLE = 6
 
 
 def quote_identifier(name):
@@ -191,6 +194,8 @@ def build_strategy_matrix(df):
         "tested_combinations": 0,
         "failed_min_trades": 0,
         "failed_min_avg_return": 0,
+        "failed_min_win_rate": 0,
+        "failed_max_loss": 0,
         "passed_all_filters": 0,
     }
     generated_at = datetime.now().isoformat(timespec="seconds")
@@ -206,9 +211,20 @@ def build_strategy_matrix(df):
 
             trade_array = np.array(trades, dtype=float)
             avg_return_pct = round(float(np.mean(trade_array)), 2)
+            win_rate_pct = round(float((trade_array > 0).mean() * 100), 2)
+            min_return_pct = round(float(np.min(trade_array)), 2)
+            max_return_pct = round(float(np.max(trade_array)), 2)
 
             if avg_return_pct < MIN_AVG_RETURN_PCT:
                 stats["failed_min_avg_return"] += 1
+                continue
+
+            if win_rate_pct < MIN_WIN_RATE_PCT:
+                stats["failed_min_win_rate"] += 1
+                continue
+
+            if min_return_pct < MAX_ACCEPTABLE_LOSS_PCT:
+                stats["failed_max_loss"] += 1
                 continue
 
             results.append(
@@ -217,9 +233,9 @@ def build_strategy_matrix(df):
                     "exit_rsi": exit_rsi,
                     "avg_return_pct": avg_return_pct,
                     "trades": int(len(trade_array)),
-                    "win_rate_pct": round(float((trade_array > 0).mean() * 100), 2),
-                    "min_return_pct": round(float(np.min(trade_array)), 2),
-                    "max_return_pct": round(float(np.max(trade_array)), 2),
+                    "win_rate_pct": win_rate_pct,
+                    "min_return_pct": min_return_pct,
+                    "max_return_pct": max_return_pct,
                     "first_trade_date": min(exit_dates).strftime("%Y-%m-%d"),
                     "last_trade_date": max(exit_dates).strftime("%Y-%m-%d"),
                     "generated_at": generated_at,
@@ -227,7 +243,17 @@ def build_strategy_matrix(df):
             )
             stats["passed_all_filters"] += 1
 
-    return pd.DataFrame(results), stats
+    matrix_df = pd.DataFrame(results)
+    if matrix_df.empty:
+        return matrix_df, stats
+
+    # Keep compact set of strongest rules per table to avoid noisy/overfit buckets.
+    matrix_df = matrix_df.sort_values(
+        by=["avg_return_pct", "win_rate_pct", "trades", "min_return_pct", "exit_rsi"],
+        ascending=[False, False, False, False, True],
+    ).head(MAX_RULES_PER_TABLE)
+
+    return matrix_df.reset_index(drop=True), stats
 
 
 def replace_heatmap_rows(conn, output_table, source_table, heatmap_df):
@@ -314,6 +340,16 @@ def main():
                 reason = (
                     f"none met MIN_AVG_RETURN_PCT={MIN_AVG_RETURN_PCT:.2f}% "
                     f"after passing MIN_TRADES={MIN_TRADES}"
+                )
+            elif build_stats["failed_min_win_rate"] > 0:
+                reason = (
+                    f"none met MIN_WIN_RATE_PCT={MIN_WIN_RATE_PCT:.2f}% "
+                    f"after passing return/trade filters"
+                )
+            elif build_stats["failed_max_loss"] > 0:
+                reason = (
+                    f"none met MAX_ACCEPTABLE_LOSS_PCT={MAX_ACCEPTABLE_LOSS_PCT:.2f}% "
+                    f"(worst loss filter)"
                 )
             else:
                 reason = "no strategy rows were produced"

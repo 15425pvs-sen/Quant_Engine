@@ -90,6 +90,12 @@ Tables:
 Purpose:
 - Store run-level and step-level status for the production pipeline
 
+## Steps to Run
+1. Run uvicorn signal_api:app --host 0.0.0.0 --port 8000
+2. Run ngrok http 8000
+3. Then at path D:\QuantApplication\Database_Quant, run script "py quant_engine.py". This will download all the historical stock data along with RSI values & fill in the DB.
+4. Then open StratEdge application and run "Refresh Signals".
+
 ## Scripts
 
 ### 1. `download_indian_stock_history.py`
@@ -189,7 +195,7 @@ Pipeline order:
 1. Download stock history
 2. Ingest CSV data into SQLite
 3. Fill RSI only for missing rows
-4. Build heatmap rows only for missing or changed equity tables
+4. Build heatmap rows only for equity tables that do not already exist in `rsi_heatmap_data`
 5. Run `rsi_live_signal_engine.py --check-last-rsi` as the final signal-generation step
 
 Features:
@@ -198,6 +204,9 @@ Features:
 - Step logging into SQLite
 - Symbol-scoped execution
 - Selective heatmap rebuilds
+- If no symbols are passed, the script discovers all equity tables from SQLite and runs for all of them
+- `RUN-ALL` is treated as a reserved orchestrator token and is not forwarded to `quant_engine.py`
+- Run timestamps in `quant_engine_runs` and `quant_engine_steps` are written in IST (`+05:30`)
 - Final logged signal step: `signals:last_rsi`
 
 Usage:
@@ -244,6 +253,8 @@ Purpose:
 Selection behavior:
 - If multiple heatmap rows share the same `entry_rsi`, BUY evaluation now prefers the highest `avg_return_pct` bucket first
 - Ties are further ranked by higher `trades`, then lower `exit_rsi`
+- BUY signals allow a small recovery window: if `current_rsi` is within 2 RSI points above `entry_rsi`, the engine can still regenerate a BUY when the crossover was missed
+- SELL signals use the same 2-point recovery window above `exit_rsi`
 
 Modes:
 - Default mode computes a live RSI using the latest `yfinance` price
@@ -275,14 +286,27 @@ Endpoints:
 - `GET /health`
 - `POST /run-signals`
 - `GET /run-signals/status`
+- `POST /add/watchlist`
+- `GET /add/watchlist/status`
 - `GET /signals/today`
 - `POST /test/signals/seed`
 
 Security:
 - `POST /run-signals` requires `X-API-Key`
 - `GET /run-signals/status` requires `X-API-Key`
+- `POST /add/watchlist` requires `X-API-Key`
+- `GET /add/watchlist/status` requires `X-API-Key`
 - `GET /signals/today` requires `X-API-Key`
 - `POST /test/signals/seed` requires `X-API-Key`
+
+Watchlist behavior:
+- `POST /add/watchlist` accepts a space-separated symbol string
+- Submitting `RUN-ALL` runs `quant_engine.py` without symbol arguments
+- `GET /add/watchlist/status` returns:
+  - the current job state
+  - the list of equity tables discovered from SQLite
+  - the latest `quant_engine_runs` row as `engine_run`
+  - a `run_all` flag so the client can distinguish a full pipeline run
 
 ## Environment Variables
 
@@ -484,12 +508,13 @@ Example request body:
 ```json
 {
   "equity": "INFY",
-  "rsi_entry": 25,
-  "rsi_exit": 70,
+  "rsi_entry": 35,
+  "rsi_exit": 55,
   "signal_type": "BUY",
-  "current_rsi": 26.4,
-  "ltp": 1300.0,
-  "signal_timestamp": "2026-04-12T09:15:00"
+  "current_rsi": 36.4,
+  "ltp": 1789.25,
+  "buy_signal_id": 123,
+  "signal_timestamp": "2026-04-19T10:15:00"
 }
 ```
 
@@ -497,13 +522,15 @@ Example SELL seed body:
 
 ```json
 {
-  "equity": "RELIANCE",
-  "rsi_entry": 25,
-  "rsi_exit": 70,
+  "equity": "INFY",
+  "rsi_entry": 35,
+  "rsi_exit": 55,
   "signal_type": "SELL",
-  "current_rsi": 71.2,
-  "ltp": 1528.90,
-  "signal_timestamp": "2026-04-10T15:45:00"
+  "current_rsi": 56.2,
+  "ltp": 1842.10,
+  "buy_signal_id": 123,
+  "signal_timestamp": "2026-04-19T14:20:00",
+  "trigger_exit_rsi": 55
 }
 ```
 ## Postman Test Examples
@@ -592,6 +619,10 @@ Current behavior:
 - This will run the script rsi_live_signal_engine.py on all the equity &    try to get a Buy/Sell calls. If a Buy/Sell call is generated the same will be listed in the application.
 - `Refresh Signals` calls `GET /signals/today`
 - The app shows missed BUY/SELL calls from previous dates up to today
+- Watchlist tab accepts a space-separated symbol string and also supports `RUN-ALL`
+- `RUN-ALL` triggers the full quant pipeline through `POST /add/watchlist`
+- The Watchlist tab has a manual `Refresh` action that calls `GET /add/watchlist/status`
+- Watchlist status is backed by the persisted `quant_engine_runs` row when available
 - Signal cards are shown newest-first
 - BUY signals require explicit investment confirmation
 - SELL signals are optional and show `SELL` plus `Dismiss`

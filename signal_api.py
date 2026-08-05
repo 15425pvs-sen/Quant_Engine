@@ -26,6 +26,9 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "quant_historic_data.db"
 SIGNAL_ENGINE_PATH = BASE_DIR / "rsi_live_signal_engine.py"
 SIGNAL_LOG_TABLE = "rsi_live_signal_log"
+BUY_OPEN_STATE = "OPEN"
+BUY_CLOSED_STATE = "CLOSED"
+SELL_CONFIRMED_STATE = "CONFIRMED"
 WATCHLIST_ENGINE_PATH = BASE_DIR / "quant_engine.py"
 API_KEY_HEADER_NAME = "X-API-Key"
 EXPECTED_API_KEY = os.getenv("QUANT_API_KEY", "").strip()
@@ -96,6 +99,9 @@ class SeedSignalRequest(BaseModel):
     current_rsi: float
     ltp: float
     signal_timestamp: str | None = None
+    buy_signal_id: int | None = None
+    trigger_exit_rsi: int | None = None
+
 
 class WatchlistRequest(BaseModel):
     symbols: str  # space-separated string
@@ -155,7 +161,12 @@ def ensure_signal_log_table(conn: sqlite3.Connection) -> None:
             ltp               REAL NOT NULL,
             signal_date       TEXT NOT NULL,
             signal_timestamp  TEXT NOT NULL,
-            notes             TEXT
+            notes             TEXT,
+            position_state    TEXT NOT NULL DEFAULT 'OPEN',
+            buy_signal_id     INTEGER,
+            trigger_exit_rsi  INTEGER,
+            action_timestamp  TEXT,
+            closed_by_signal_id INTEGER
         )
         """
     )
@@ -165,6 +176,35 @@ def ensure_signal_log_table(conn: sqlite3.Connection) -> None:
         ON {quote_identifier(SIGNAL_LOG_TABLE)} (source_table, entry_rsi, exit_rsi, signal_timestamp)
         """
     )
+    existing_cols = {
+        row[1].lower()
+        for row in conn.execute(f"PRAGMA table_info({quote_identifier(SIGNAL_LOG_TABLE)})")
+    }
+    if "position_state" not in existing_cols:
+        conn.execute(
+            f"ALTER TABLE {quote_identifier(SIGNAL_LOG_TABLE)} "
+            "ADD COLUMN position_state TEXT NOT NULL DEFAULT 'OPEN'"
+        )
+    if "buy_signal_id" not in existing_cols:
+        conn.execute(
+            f"ALTER TABLE {quote_identifier(SIGNAL_LOG_TABLE)} "
+            "ADD COLUMN buy_signal_id INTEGER"
+        )
+    if "trigger_exit_rsi" not in existing_cols:
+        conn.execute(
+            f"ALTER TABLE {quote_identifier(SIGNAL_LOG_TABLE)} "
+            "ADD COLUMN trigger_exit_rsi INTEGER"
+        )
+    if "action_timestamp" not in existing_cols:
+        conn.execute(
+            f"ALTER TABLE {quote_identifier(SIGNAL_LOG_TABLE)} "
+            "ADD COLUMN action_timestamp TEXT"
+        )
+    if "closed_by_signal_id" not in existing_cols:
+        conn.execute(
+            f"ALTER TABLE {quote_identifier(SIGNAL_LOG_TABLE)} "
+            "ADD COLUMN closed_by_signal_id INTEGER"
+        )
     conn.commit()
 
 
@@ -370,6 +410,7 @@ def get_today_signals(
     conn.row_factory = sqlite3.Row
 
     try:
+        ensure_signal_log_table(conn)
         if not table_exists(conn, SIGNAL_LOG_TABLE):
             return {"date": today, "signals": []}
 
@@ -383,7 +424,10 @@ def get_today_signals(
                 signal_type,
                 current_rsi,
                 ltp,
-                signal_timestamp
+                signal_timestamp,
+                position_state,
+                buy_signal_id,
+                trigger_exit_rsi
             FROM {quote_identifier(SIGNAL_LOG_TABLE)}
             WHERE signal_date <= ?
             ORDER BY signal_timestamp DESC, id DESC
@@ -403,6 +447,9 @@ def get_today_signals(
             "current_rsi": row["current_rsi"],
             "ltp": row["ltp"],
             "signal_timestamp": row["signal_timestamp"],
+            "position_state": row["position_state"],
+            "buy_signal_id": row["buy_signal_id"],
+            "trigger_exit_rsi": row["trigger_exit_rsi"],
         }
         for row in rows
     ]
@@ -428,8 +475,15 @@ def seed_test_signal(
     signal_date = timestamp.split("T", 1)[0]
 
     conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
     try:
         ensure_signal_log_table(conn)
+        linked_buy_id: int | None = None
+        if request.buy_signal_id is not None:
+            linked_buy_id = int(request.buy_signal_id)
+            if linked_buy_id <= 0:
+                raise HTTPException(status_code=400, detail="buy_signal_id must be positive.")
+
         cursor = conn.execute(
             f"""
             INSERT INTO {quote_identifier(SIGNAL_LOG_TABLE)} (
@@ -442,9 +496,14 @@ def seed_test_signal(
                 ltp,
                 signal_date,
                 signal_timestamp,
-                notes
+                notes,
+                position_state,
+                buy_signal_id,
+                trigger_exit_rsi,
+                action_timestamp,
+                closed_by_signal_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 request.equity.strip().upper(),
@@ -457,10 +516,30 @@ def seed_test_signal(
                 signal_date,
                 timestamp,
                 "Seeded test signal for mobile app flow validation.",
+                BUY_OPEN_STATE if signal_type == "BUY" else SELL_CONFIRMED_STATE,
+                linked_buy_id,
+                int(request.trigger_exit_rsi) if request.trigger_exit_rsi is not None else None,
+                timestamp if signal_type == "SELL" else None,
+                None,
             ),
         )
-        conn.commit()
         inserted_id = int(cursor.lastrowid)
+
+        linked_buy_closed = False
+        if signal_type == "SELL" and linked_buy_id is not None:
+            close_result = conn.execute(
+                f"""
+                UPDATE {quote_identifier(SIGNAL_LOG_TABLE)}
+                SET position_state = ?, action_timestamp = ?, closed_by_signal_id = ?
+                WHERE id = ?
+                  AND signal_type = 'BUY'
+                  AND COALESCE(position_state, '{BUY_OPEN_STATE}') = '{BUY_OPEN_STATE}'
+                """,
+                (BUY_CLOSED_STATE, timestamp, inserted_id, linked_buy_id),
+            )
+            linked_buy_closed = close_result.rowcount > 0
+
+        conn.commit()
     finally:
         conn.close()
 
@@ -472,7 +551,11 @@ def seed_test_signal(
         "rsi_exit": request.rsi_exit,
         "signal_type": signal_type,
         "signal_timestamp": timestamp,
+        "buy_signal_id": linked_buy_id,
+        "trigger_exit_rsi": request.trigger_exit_rsi,
+        "linked_buy_closed": linked_buy_closed if signal_type == "SELL" else None,
     }
+
 
 @app.post("/add/watchlist")
 def add_watchlist(
