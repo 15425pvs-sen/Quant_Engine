@@ -97,6 +97,13 @@ Purpose:
 4. Then run py rsi_live_signal_engine.py --check-latest-rsi or py rsi_live_signal_engine.py RELIANCE --check-latest-rsi.
 5. Then open StratEdge application and run "Refresh Signals".
 
+## Trading RSI
+1. py build_rsi_heatmap_table.py RELIANCE rsi_heatmap_data_for_trading --min-profit 0.5 --max-profit 2.0
+2. py live_rsi_tracking.py --interval 30
+3. py build_rsi_heatmap_table.py rsi_heatmap_data_for_trading -> run for all stocks
+4. py build_rsi_heatmap_table.py COCHINSHIP rsi_heatmap_data_for_trading
+5. py live_rsi_tracking.py --symbols RELIANCE--interval 30
+
 ## Scripts
 
 ### 1. `download_indian_stock_history.py`

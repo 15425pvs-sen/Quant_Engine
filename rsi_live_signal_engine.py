@@ -152,6 +152,36 @@ def ensure_signal_log_table(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def has_buy_entry_rsi(conn: sqlite3.Connection, source_table: str, entry_rsi: int) -> bool:
+        row = conn.execute(
+                f"""
+                SELECT 1
+                FROM {quote_identifier(SIGNAL_LOG_TABLE)}
+                WHERE trim(upper(source_table)) = trim(upper(?))
+                    AND signal_type = 'BUY'
+                    AND entry_rsi = ?
+                LIMIT 1
+                """,
+                (source_table, entry_rsi),
+        ).fetchone()
+        return row is not None
+
+
+def has_buy_current_rsi(conn: sqlite3.Connection, source_table: str, current_rsi: float) -> bool:
+        row = conn.execute(
+                f"""
+                SELECT 1
+                FROM {quote_identifier(SIGNAL_LOG_TABLE)}
+                WHERE trim(upper(source_table)) = trim(upper(?))
+                    AND signal_type = 'BUY'
+                    AND ABS(current_rsi - ?) < 0.001
+                LIMIT 1
+                """,
+                (source_table, current_rsi),
+        ).fetchone()
+        return row is not None
+
+
 def has_open_buy_bucket(
     conn: sqlite3.Connection,
     source_table: str,
@@ -282,6 +312,39 @@ def get_sell_signal_reason_latest_rsi(
         return None
 
     return "Latest RSI hit the exit bucket for this stock."
+
+
+def get_matching_sell_bucket(
+    stock_rules: pd.DataFrame,
+    previous_rsi: float | None,
+    current_rsi: float | None,
+    buy_exit_rsi: int,
+    check_last_rsi: bool = False,
+    check_latest_rsi: bool = False,
+) -> tuple[int, int] | None:
+    if current_rsi is None:
+        return None
+
+    candidates: list[tuple[int, int]] = []
+    for _, rule in stock_rules.iterrows():
+        exit_rsi = int(rule["exit_rsi"])
+        if exit_rsi == buy_exit_rsi:
+            continue
+
+        if check_latest_rsi:
+            if current_rsi >= exit_rsi:
+                candidates.append((int(rule["entry_rsi"]), exit_rsi))
+            continue
+
+        if previous_rsi is None:
+            continue
+        if previous_rsi < exit_rsi <= current_rsi:
+            candidates.append((int(rule["entry_rsi"]), exit_rsi))
+
+    if not candidates:
+        return None
+
+    return sorted(candidates, key=lambda bucket: bucket[1])[0]
 
 
 def get_buy_signal_reason(
@@ -645,6 +708,13 @@ def build_signal_rows(
                 entry_rsi = int(selected_rule["entry_rsi"])
                 exit_rsi = int(selected_rule["exit_rsi"])
                 buy_reason = get_buy_signal_reason_latest_rsi(current_rsi, entry_rsi, exit_rsi)
+
+                # runtime duplicate guards: skip if any BUY for this entry_rsi or current_rsi already exists
+                if has_buy_entry_rsi(conn, source_table, entry_rsi):
+                    continue
+                if has_buy_current_rsi(conn, source_table, current_rsi):
+                    continue
+
                 signal_rows.append(
                     {
                         "source_table": source_table,
@@ -682,36 +752,56 @@ def build_signal_rows(
 
                 if buy_reason:
                     already_logged = has_open_buy_bucket(conn, source_table, entry_rsi, exit_rsi)
-                    if not already_logged:
-                        signal_rows.append(
-                            {
-                                "source_table": source_table,
-                                "signal_type": "BUY",
-                                "entry_rsi": entry_rsi,
-                                "exit_rsi": exit_rsi,
-                                "previous_rsi": previous_rsi,
-                                "current_rsi": current_rsi,
-                                "ltp": round(float(ltp), 2),
-                                "signal_date": signal_date,
-                                "signal_timestamp": signal_timestamp,
-                                "position_state": BUY_OPEN_STATE,
-                                "buy_signal_id": None,
-                                "trigger_exit_rsi": None,
-                                "action_timestamp": None,
-                                "closed_by_signal_id": None,
-                                "notes": buy_reason,
-                            }
-                        )
-                        print(
-                            f"BUY  {source_table}  bucket=({entry_rsi},{exit_rsi})  "
-                            f"RSI {previous_rsi:.2f}->{current_rsi:.2f}  reason={buy_reason}"
-                        )
+                    # skip if already open, or if any previous BUY exists for same entry_rsi or same current_rsi
+                    if already_logged or has_buy_entry_rsi(conn, source_table, entry_rsi) or has_buy_current_rsi(conn, source_table, current_rsi):
+                        continue
+                    signal_rows.append(
+                        {
+                            "source_table": source_table,
+                            "signal_type": "BUY",
+                            "entry_rsi": entry_rsi,
+                            "exit_rsi": exit_rsi,
+                            "previous_rsi": previous_rsi,
+                            "current_rsi": current_rsi,
+                            "ltp": round(float(ltp), 2),
+                            "signal_date": signal_date,
+                            "signal_timestamp": signal_timestamp,
+                            "position_state": BUY_OPEN_STATE,
+                            "buy_signal_id": None,
+                            "trigger_exit_rsi": None,
+                            "action_timestamp": None,
+                            "closed_by_signal_id": None,
+                            "notes": buy_reason,
+                        }
+                    )
+                    print(
+                        f"BUY  {source_table}  bucket=({entry_rsi},{exit_rsi})  "
+                        f"RSI {previous_rsi:.2f}->{current_rsi:.2f}  reason={buy_reason}"
+                    )
 
         for buy_signal_id, buy_entry_rsi, buy_exit_rsi in get_open_buy_rows(conn, source_table):
             if has_sell_for_buy(conn, buy_signal_id):
                 continue
+
+            sell_entry_rsi = buy_entry_rsi
+            sell_exit_rsi = buy_exit_rsi
+            sell_reason: str | None = None
+
             if check_latest_rsi:
                 sell_reason = get_sell_signal_reason_latest_rsi(current_rsi, buy_exit_rsi)
+                if sell_reason is None:
+                    matched_bucket = get_matching_sell_bucket(
+                        stock_rules,
+                        previous_rsi=current_rsi,
+                        current_rsi=current_rsi,
+                        buy_exit_rsi=buy_exit_rsi,
+                        check_latest_rsi=True,
+                    )
+                    if matched_bucket is not None:
+                        sell_entry_rsi, sell_exit_rsi = matched_bucket
+                        sell_reason = (
+                            f"Latest RSI hit alternate exit bucket ({sell_entry_rsi},{sell_exit_rsi})."
+                        )
             else:
                 sell_reason = get_sell_signal_reason(
                     previous_rsi,
@@ -719,21 +809,32 @@ def build_signal_rows(
                     buy_exit_rsi,
                     check_last_rsi,
                 )
+                if sell_reason is None:
+                    matched_bucket = get_matching_sell_bucket(
+                        stock_rules,
+                        previous_rsi=previous_rsi,
+                        current_rsi=current_rsi,
+                        buy_exit_rsi=buy_exit_rsi,
+                        check_last_rsi=check_last_rsi,
+                    )
+                    if matched_bucket is not None:
+                        sell_entry_rsi, sell_exit_rsi = matched_bucket
+                        sell_reason = (
+                            f"Exit RSI crossover detected on alternate bucket ({sell_entry_rsi},{sell_exit_rsi})."
+                        )
 
             if sell_reason is None:
                 continue
 
-            if check_latest_rsi and has_signal_bucket(
-                conn, source_table, "SELL", buy_entry_rsi, buy_exit_rsi
-            ):
+            if has_signal_bucket(conn, source_table, "SELL", sell_entry_rsi, sell_exit_rsi):
                 continue
 
             signal_rows.append(
                 {
                     "source_table": source_table,
                     "signal_type": "SELL",
-                    "entry_rsi": buy_entry_rsi,
-                    "exit_rsi": buy_exit_rsi,
+                    "entry_rsi": sell_entry_rsi,
+                    "exit_rsi": sell_exit_rsi,
                     "previous_rsi": previous_rsi,
                     "current_rsi": current_rsi,
                     "ltp": round(float(ltp), 2),
@@ -741,15 +842,15 @@ def build_signal_rows(
                     "signal_timestamp": signal_timestamp,
                     "position_state": SELL_CONFIRMED_STATE,
                     "buy_signal_id": buy_signal_id,
-                    "trigger_exit_rsi": buy_exit_rsi,
+                    "trigger_exit_rsi": sell_exit_rsi,
                     "action_timestamp": signal_timestamp,
                     "closed_by_signal_id": None,
-                    "notes": f"{sell_reason} trigger_exit_rsi={buy_exit_rsi}.",
+                    "notes": f"{sell_reason} trigger_exit_rsi={sell_exit_rsi}.",
                 }
             )
             print(
-                f"SELL {source_table}  buy_id={buy_signal_id} bucket=({buy_entry_rsi},{buy_exit_rsi})  "
-                f"trigger_exit={buy_exit_rsi}  RSI {previous_rsi:.2f}->{current_rsi:.2f}  reason={sell_reason}"
+                f"SELL {source_table}  buy_id={buy_signal_id} bucket=({sell_entry_rsi},{sell_exit_rsi})  "
+                f"trigger_exit={sell_exit_rsi}  RSI {previous_rsi:.2f}->{current_rsi:.2f}  reason={sell_reason}"
             )
 
     return signal_rows
