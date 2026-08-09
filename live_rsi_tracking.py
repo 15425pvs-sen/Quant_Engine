@@ -8,11 +8,13 @@ Usage:
     py live_rsi_tracking.py --interval 30
     py live_rsi_tracking.py --symbols RELIANCE TCS
     py live_rsi_tracking.py --hybrid
+    py live_rsi_tracking.py --hybrid --interval 15
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sqlite3
 import time
 from datetime import datetime
@@ -83,6 +85,11 @@ def parse_args() -> argparse.Namespace:
         "--results",
         action="store_true",
         help="Print realized P&L from all completed BUY/SELL signals in the trading signal log.",
+    )
+    parser.add_argument(
+        "--telegram",
+        action="store_true",
+        help="Send BUY/SELL alerts to Telegram if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are configured.",
     )
     return parser.parse_args()
 
@@ -516,6 +523,31 @@ def compute_live_rsi(history_df: pd.DataFrame, ltp: float) -> float | None:
     return round(float(current_rsi), 2)
 
 
+def send_telegram_message(message: str, bot_token: str | None = None, chat_id: str | None = None) -> bool:
+    if not message.strip():
+        return False
+
+    token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN")
+    chat = chat_id or os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        return False
+
+    try:
+        import requests
+    except ImportError:
+        return False
+
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={"chat_id": chat, "text": message, "parse_mode": "HTML"},
+            timeout=10,
+        )
+        return response.ok
+    except Exception:
+        return False
+
+
 def insert_signal_row(conn: sqlite3.Connection, row: dict[str, object]) -> int:
     cursor = conn.execute(
         f"""
@@ -571,6 +603,7 @@ def handle_source_table(
     latest_close: float | None = None,
     use_hybrid: bool = False,
     previous_rsi: float | None = None,
+    send_to_telegram: bool = False,
 ) -> None:
     table_rules = heatmap_df[heatmap_df["source_table"] == source_table]
     if table_rules.empty:
@@ -625,9 +658,13 @@ def handle_source_table(
             },
         )
         close_buy_bucket(conn, buy_id, sell_id, signal_timestamp)
-        print(
-            f"SELL   {source_table} closed_buy_id={buy_id} bucket=({buy_entry_rsi},{buy_exit_rsi}) current_rsi={current_rsi:.2f} ltp={ltp:.2f}"
+        message = (
+            f"SELL {source_table} | closed_buy_id={buy_id} | bucket=({buy_entry_rsi},{buy_exit_rsi}) | "
+            f"RSI {current_rsi:.2f} | LTP {ltp:.2f}"
         )
+        print(message)
+        if send_to_telegram:
+            send_telegram_message(message)
         return
 
     # If no SELL was generated, allow new BUY signals only when no open BUY exists for that bucket
@@ -678,9 +715,12 @@ def handle_source_table(
                 "closed_by_signal_id": None,
             },
         )
-        print(
-            f"BUY    {source_table} bucket=({entry_rsi},{exit_rsi}) current_rsi={current_rsi:.2f} ltp={ltp:.2f}"
+        message = (
+            f"BUY {source_table} | bucket=({entry_rsi},{exit_rsi}) | RSI {current_rsi:.2f} | LTP {ltp:.2f}"
         )
+        print(message)
+        if send_to_telegram:
+            send_telegram_message(message)
         return
 
 
@@ -740,6 +780,7 @@ def main() -> None:
                     latest_close=latest_close,
                     use_hybrid=args.hybrid,
                     previous_rsi=previous_rsi,
+                    send_to_telegram=args.telegram,
                 )
 
             time.sleep(interval_seconds)
