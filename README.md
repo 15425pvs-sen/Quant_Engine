@@ -103,6 +103,8 @@ Purpose:
 3. py build_rsi_heatmap_table.py rsi_heatmap_data_for_trading -> run for all stocks
 4. py build_rsi_heatmap_table.py COCHINSHIP rsi_heatmap_data_for_trading
 5. py live_rsi_tracking.py --symbols RELIANCE--interval 30
+6. py live_rsi_tracking.py --hybrid
+7. py live_rsi_tracking.py --hybrid --results -> to get the overall results.
 
 ## Scripts
 

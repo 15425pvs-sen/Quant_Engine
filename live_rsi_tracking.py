@@ -9,6 +9,7 @@ Usage:
     py live_rsi_tracking.py --symbols RELIANCE TCS
     py live_rsi_tracking.py --hybrid
     py live_rsi_tracking.py --hybrid --interval 15
+    py live_rsi_tracking.py --hybrid --results
 """
 
 from __future__ import annotations
@@ -290,10 +291,10 @@ def has_open_buy_bucket(
     return row is not None
 
 
-def get_open_buy_rows(conn: sqlite3.Connection, source_table: str) -> list[tuple[int, int, int]]:
+def get_open_buy_rows(conn: sqlite3.Connection, source_table: str) -> list[tuple[int, int, int, float]]:
     rows = conn.execute(
         f"""
-        SELECT id, entry_rsi, exit_rsi
+        SELECT id, entry_rsi, exit_rsi, ltp
         FROM {quote_identifier(SIGNAL_LOG_TABLE)}
         WHERE trim(upper(source_table)) = trim(upper(?))
           AND signal_type = 'BUY'
@@ -302,7 +303,15 @@ def get_open_buy_rows(conn: sqlite3.Connection, source_table: str) -> list[tuple
         """,
         (source_table,),
     ).fetchall()
-    return [(int(row[0]), int(row[1]), int(row[2])) for row in rows]
+    return [
+        (
+            int(row[0]),
+            int(row[1]),
+            int(row[2]),
+            float(row[3]),
+        )
+        for row in rows
+    ]
 
 
 def has_buy_entry_rsi(conn: sqlite3.Connection, source_table: str, entry_rsi: int) -> bool:
@@ -615,7 +624,7 @@ def handle_source_table(
     )
 
     # First attempt to close any open BUY buckets with matching exit conditions.
-    for buy_id, buy_entry_rsi, buy_exit_rsi in get_open_buy_rows(conn, source_table):
+    for buy_id, buy_entry_rsi, buy_exit_rsi, buy_ltp in get_open_buy_rows(conn, source_table):
         sell_reason = get_sell_signal_reason_latest_rsi(current_rsi, buy_exit_rsi)
         alternative_bucket = None
         if not sell_reason:
@@ -635,6 +644,9 @@ def handle_source_table(
                     buy_exit_rsi = alternative_exit_rsi
 
         if not sell_reason:
+            continue
+
+        if ltp <= buy_ltp:
             continue
 
         sell_id = insert_signal_row(
