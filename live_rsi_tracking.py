@@ -10,6 +10,8 @@ Usage:
     py live_rsi_tracking.py --hybrid
     py live_rsi_tracking.py --hybrid --interval 15
     py live_rsi_tracking.py --hybrid --results
+    py live_rsi_tracking.py --hybrid --telegram
+    py live_rsi_tracking.py --hybrid --buy-rsi-protection 1.0 --min-profit-pct 0.05 --telegram
 """
 
 from __future__ import annotations
@@ -91,6 +93,36 @@ def parse_args() -> argparse.Namespace:
         "--telegram",
         action="store_true",
         help="Send BUY/SELL alerts to Telegram if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are configured.",
+    )
+    parser.add_argument(
+        "--telegram-bot-token",
+        dest="telegram_bot_token",
+        help="Telegram bot token to use for sending alerts (overrides TELEGRAM_BOT_TOKEN env var).",
+    )
+    parser.add_argument(
+        "--telegram-chat-id",
+        dest="telegram_chat_id",
+        help="Telegram chat id to send alerts to (overrides TELEGRAM_CHAT_ID env var).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="Do not write BUY/SELL rows to the database; print and (optionally) send alerts only for testing.",
+    )
+    parser.add_argument(
+        "--min-profit-pct",
+        dest="min_profit_pct",
+        type=float,
+        default=0.0,
+        help="Minimum profit percent required to allow a SELL (skip tiny profits).",
+    )
+    parser.add_argument(
+        "--buy-rsi-protection",
+        dest="buy_rsi_protection",
+        type=float,
+        default=0.0,
+        help="Minimum difference required between exit RSI and current RSI to allow a BUY (e.g. 1.0).",
     )
     return parser.parse_args()
 
@@ -539,7 +571,26 @@ def send_telegram_message(message: str, bot_token: str | None = None, chat_id: s
     token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN")
     chat = chat_id or os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat:
+        print(
+            "Telegram not sent: missing token or chat. ",
+            f"token_provided={bool(token)} chat_provided={bool(chat)}",
+        )
         return False
+
+    # Basic validation & masked debug info to help diagnose common configuration issues
+    def _mask(s: str) -> str:
+        if not s:
+            return ""
+        return s if len(s) <= 12 else f"{s[:6]}...{s[-6:]}"
+
+    if ":" not in token:
+        print(f"Telegram token looks malformed (missing ':'). token_sample={_mask(token)}")
+
+    if not str(chat).lstrip("-").isdigit():
+        print(f"Telegram chat id looks non-numeric: {chat!r}")
+
+    masked_url = f"https://api.telegram.org/bot{_mask(token)}/sendMessage"
+    print(f"Attempting Telegram send -> url={masked_url} chat_id={_mask(str(chat))} message_len={len(message)}")
 
     try:
         import requests
@@ -552,8 +603,17 @@ def send_telegram_message(message: str, bot_token: str | None = None, chat_id: s
             data={"chat_id": chat, "text": message, "parse_mode": "HTML"},
             timeout=10,
         )
+        if not response.ok:
+            try:
+                text = response.text
+            except Exception:
+                text = "<no response body>"
+            print(
+                f"Telegram send failed: status={response.status_code} response={text}"
+            )
         return response.ok
-    except Exception:
+    except Exception as exc:
+        print(f"Telegram send exception: {exc}")
         return False
 
 
@@ -613,7 +673,12 @@ def handle_source_table(
     use_hybrid: bool = False,
     previous_rsi: float | None = None,
     send_to_telegram: bool = False,
-) -> None:
+    dry_run: bool = False,
+    telegram_bot_token: str | None = None,
+    telegram_chat_id: str | None = None,
+    min_profit_pct: float = 0.0,
+    buy_rsi_protection: float = 0.0,
+ ) -> None:
     table_rules = heatmap_df[heatmap_df["source_table"] == source_table]
     if table_rules.empty:
         return
@@ -649,34 +714,52 @@ def handle_source_table(
         if ltp <= buy_ltp:
             continue
 
-        sell_id = insert_signal_row(
-            conn,
-            {
-                "source_table": source_table,
-                "signal_type": "SELL",
-                "entry_rsi": buy_entry_rsi,
-                "exit_rsi": buy_exit_rsi,
-                "previous_rsi": current_rsi,
-                "current_rsi": current_rsi,
-                "ltp": ltp,
-                "signal_date": signal_date,
-                "signal_timestamp": signal_timestamp,
-                "notes": sell_reason,
-                "position_state": SELL_CONFIRMED_STATE,
-                "buy_signal_id": buy_id,
-                "trigger_exit_rsi": buy_exit_rsi,
-                "action_timestamp": signal_timestamp,
-                "closed_by_signal_id": None,
-            },
-        )
-        close_buy_bucket(conn, buy_id, sell_id, signal_timestamp)
+        # Require minimum profit percentage before creating a SELL to avoid tiny P&L trades
+        try:
+            profit_pct = ((float(ltp) - float(buy_ltp)) / float(buy_ltp)) * 100.0
+        except Exception:
+            profit_pct = 0.0
+
+        if profit_pct <= float(min_profit_pct):
+            print(
+                f"Skipping SELL {source_table} for buy_id={buy_id}: profit={profit_pct:.4f}% <= min_profit_pct={min_profit_pct}"
+            )
+            continue
+
+        if not dry_run:
+            sell_id = insert_signal_row(
+                conn,
+                {
+                    "source_table": source_table,
+                    "signal_type": "SELL",
+                    "entry_rsi": buy_entry_rsi,
+                    "exit_rsi": buy_exit_rsi,
+                    "previous_rsi": current_rsi,
+                    "current_rsi": current_rsi,
+                    "ltp": ltp,
+                    "signal_date": signal_date,
+                    "signal_timestamp": signal_timestamp,
+                    "notes": sell_reason,
+                    "position_state": SELL_CONFIRMED_STATE,
+                    "buy_signal_id": buy_id,
+                    "trigger_exit_rsi": buy_exit_rsi,
+                    "action_timestamp": signal_timestamp,
+                    "closed_by_signal_id": None,
+                },
+            )
+            close_buy_bucket(conn, buy_id, sell_id, signal_timestamp)
+        else:
+            sell_id = None
+
         message = (
             f"SELL {source_table} | closed_buy_id={buy_id} | bucket=({buy_entry_rsi},{buy_exit_rsi}) | "
             f"RSI {current_rsi:.2f} | LTP {ltp:.2f}"
         )
         print(message)
         if send_to_telegram:
-            send_telegram_message(message)
+            ok = send_telegram_message(message, bot_token=telegram_bot_token, chat_id=telegram_chat_id)
+            if not ok:
+                print("Telegram alert not delivered for SELL signal.")
         return
 
     # If no SELL was generated, allow new BUY signals only when no open BUY exists for that bucket
@@ -707,37 +790,85 @@ def handle_source_table(
                 # if conversion fails, skip hybrid check and allow usual RSI-only behavior
                 pass
 
-        insert_signal_row(
-            conn,
-            {
-                "source_table": source_table,
-                "signal_type": "BUY",
-                "entry_rsi": entry_rsi,
-                "exit_rsi": exit_rsi,
-                "previous_rsi": current_rsi,
-                "current_rsi": current_rsi,
-                "ltp": ltp,
-                "signal_date": signal_date,
-                "signal_timestamp": signal_timestamp,
-                "notes": buy_reason,
-                "position_state": BUY_OPEN_STATE,
-                "buy_signal_id": None,
-                "trigger_exit_rsi": None,
-                "action_timestamp": None,
-                "closed_by_signal_id": None,
-            },
-        )
+        # BUY RSI protection: ensure current RSI is sufficiently below exit_rsi
+        try:
+            rsi_gap = float(exit_rsi) - float(current_rsi)
+        except Exception:
+            rsi_gap = 0.0
+
+        if float(rsi_gap) < float(buy_rsi_protection):
+            print(
+                f"Skipping BUY {source_table}: exit_rsi={exit_rsi} current_rsi={current_rsi:.2f} gap={rsi_gap:.2f} < buy_rsi_protection={buy_rsi_protection}"
+            )
+            continue
+
+        if not dry_run:
+            insert_signal_row(
+                conn,
+                {
+                    "source_table": source_table,
+                    "signal_type": "BUY",
+                    "entry_rsi": entry_rsi,
+                    "exit_rsi": exit_rsi,
+                    "previous_rsi": current_rsi,
+                    "current_rsi": current_rsi,
+                    "ltp": ltp,
+                    "signal_date": signal_date,
+                    "signal_timestamp": signal_timestamp,
+                    "notes": buy_reason,
+                    "position_state": BUY_OPEN_STATE,
+                    "buy_signal_id": None,
+                    "trigger_exit_rsi": None,
+                    "action_timestamp": None,
+                    "closed_by_signal_id": None,
+                },
+            )
         message = (
             f"BUY {source_table} | bucket=({entry_rsi},{exit_rsi}) | RSI {current_rsi:.2f} | LTP {ltp:.2f}"
         )
         print(message)
         if send_to_telegram:
-            send_telegram_message(message)
+            ok = send_telegram_message(message, bot_token=telegram_bot_token, chat_id=telegram_chat_id)
+            if not ok:
+                print("Telegram alert not delivered for BUY signal.")
         return
 
 
 def main() -> None:
     args = parse_args()
+    def _mask_val(v: str | None) -> str:
+        if not v:
+            return ""
+        s = str(v)
+        return s if len(s) <= 12 else f"{s[:6]}...{s[-6:]}"
+
+    # Print startup summary of active protections and important flags
+    try:
+        symbols_display = ", ".join(args.symbols) if getattr(args, "symbols", None) else "ALL"
+    except Exception:
+        symbols_display = "ALL"
+
+    protections: list[str] = []
+    if getattr(args, "dry_run", False):
+        protections.append("dry_run")
+    min_p = float(getattr(args, "min_profit_pct", 0.0) or 0.0)
+    if min_p > 0:
+        protections.append(f"min_profit_pct={min_p}")
+    buy_prot = float(getattr(args, "buy_rsi_protection", 0.0) or 0.0)
+    if buy_prot > 0:
+        protections.append(f"buy_rsi_protection={buy_prot}")
+    if getattr(args, "hybrid", False):
+        protections.append("hybrid")
+
+    bot_sample = _mask_val(getattr(args, "telegram_bot_token", None) or os.getenv("TELEGRAM_BOT_TOKEN"))
+    chat_sample = _mask_val(getattr(args, "telegram_chat_id", None) or os.getenv("TELEGRAM_CHAT_ID"))
+
+    print("\nStartup configuration summary")
+    print("-" * 48)
+    print(f"Interval: {getattr(args, 'interval', DEFAULT_INTERVAL_SECONDS)}s   Symbols: {symbols_display}")
+    print(f"Telegram: {'ENABLED' if getattr(args, 'telegram', False) else 'DISABLED'}  token_sample={bot_sample} chat_sample={chat_sample}")
+    print(f"Active protections: {', '.join(protections) if protections else 'None'}")
+    print("-" * 48 + "\n")
     interval_seconds = max(5, args.interval)
     requested_symbols = [symbol.strip().upper() for symbol in (args.symbols or []) if symbol.strip()]
 
@@ -793,6 +924,11 @@ def main() -> None:
                     use_hybrid=args.hybrid,
                     previous_rsi=previous_rsi,
                     send_to_telegram=args.telegram,
+                    dry_run=getattr(args, "dry_run", False),
+                    telegram_bot_token=getattr(args, "telegram_bot_token", None),
+                    telegram_chat_id=getattr(args, "telegram_chat_id", None),
+                    min_profit_pct=getattr(args, "min_profit_pct", 0.0),
+                    buy_rsi_protection=getattr(args, "buy_rsi_protection", 0.0),
                 )
 
             time.sleep(interval_seconds)
