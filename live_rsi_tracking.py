@@ -12,6 +12,9 @@ Usage:
     py live_rsi_tracking.py --hybrid --results
     py live_rsi_tracking.py --hybrid --telegram
     py live_rsi_tracking.py --hybrid --buy-rsi-protection 1.0 --min-profit-pct 0.05 --telegram
+
+$env:UPSTOX_ALLOW_LIVE_ORDERS="true"
+py live_rsi_tracking.py --hybrid --telegram
 """
 
 from __future__ import annotations
@@ -19,12 +22,21 @@ from __future__ import annotations
 import argparse
 import os
 import sqlite3
+import subprocess
+import sys
+import re
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+try:
+    import upstox_client
+except ImportError:
+    upstox_client = None
 
 try:
     import yfinance as yf
@@ -43,6 +55,7 @@ DEFAULT_INTERVAL_SECONDS = 30
 BUY_OPEN_STATE = "OPEN"
 BUY_CLOSED_STATE = "CLOSED"
 SELL_CONFIRMED_STATE = "CONFIRMED"
+UPSTOX_LIVE_MODE = "ltpc"
 
 REQUIRED_HEATMAP_COLS = {
     "source_table",
@@ -124,6 +137,18 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Minimum difference required between exit RSI and current RSI to allow a BUY (e.g. 1.0).",
     )
+    parser.add_argument(
+        "--upstox-live",
+        action="store_true",
+        default=True,
+        help="Use the Upstox websocket feed for live LTPs instead of yfinance polling.",
+    )
+    parser.add_argument(
+        "--no-upstox-live",
+        action="store_false",
+        dest="upstox_live",
+        help="Disable the Upstox websocket feed and fall back to yfinance polling.",
+    )
     return parser.parse_args()
 
 
@@ -139,6 +164,8 @@ def ensure_signal_log_table(conn: sqlite3.Connection) -> None:
             previous_rsi      REAL NOT NULL,
             current_rsi       REAL NOT NULL,
             ltp               REAL NOT NULL,
+            qty               INTEGER,
+            product           TEXT,
             signal_date       TEXT NOT NULL,
             signal_timestamp  TEXT NOT NULL,
             notes             TEXT,
@@ -150,6 +177,18 @@ def ensure_signal_log_table(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    existing_cols = {
+        str(row[1]).lower()
+        for row in conn.execute(f"PRAGMA table_info({quote_identifier(SIGNAL_LOG_TABLE)})")
+    }
+    if "qty" not in existing_cols:
+        conn.execute(
+            f"ALTER TABLE {quote_identifier(SIGNAL_LOG_TABLE)} ADD COLUMN qty INTEGER"
+        )
+    if "product" not in existing_cols:
+        conn.execute(
+            f"ALTER TABLE {quote_identifier(SIGNAL_LOG_TABLE)} ADD COLUMN product TEXT"
+        )
     conn.execute(
         f"""
         CREATE INDEX IF NOT EXISTS idx_{SIGNAL_LOG_TABLE}_lookup
@@ -181,6 +220,154 @@ def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     return row is not None
 
 
+def _extract_upstox_ltp(feed: dict[str, object]) -> float | None:
+    if not isinstance(feed, dict):
+        return None
+
+    candidates: list[dict[str, object]] = []
+    for key in ("ltpc",):
+        value = feed.get(key)
+        if isinstance(value, dict):
+            candidates.append(value)
+
+    oc = feed.get("oc")
+    if isinstance(oc, dict):
+        value = oc.get("ltpc")
+        if isinstance(value, dict):
+            candidates.append(value)
+
+    full_feed = feed.get("fullFeed")
+    if isinstance(full_feed, dict):
+        market_ff = full_feed.get("marketFF")
+        if isinstance(market_ff, dict):
+            value = market_ff.get("ltpc")
+            if isinstance(value, dict):
+                candidates.append(value)
+
+    for candidate in candidates:
+        try:
+            ltp = candidate.get("ltp")
+            if ltp is None:
+                continue
+            return round(float(ltp), 2)
+        except Exception:
+            continue
+    return None
+
+
+class UpstoxLivePriceFeed:
+    def __init__(self, symbols: list[str]) -> None:
+        if upstox_client is None:
+            raise RuntimeError(
+                "Upstox SDK is not installed. Install it with: pip install upstox-python-sdk"
+            )
+
+        from upstox_order_manager import UpstoxOrderManager
+
+        self.symbols = [symbol.upper().strip() for symbol in symbols if symbol and symbol.strip()]
+        self.symbol_by_instrument: dict[str, str] = {}
+        self.instrument_by_symbol: dict[str, str] = {}
+        self.latest_prices: dict[str, float] = {}
+        self.lock = threading.Lock()
+        self.ready = threading.Event()
+        self.error: str | None = None
+        self.unresolved_symbols: list[str] = []
+        self.streamer = None
+
+        resolver = UpstoxOrderManager()
+        for symbol in self.symbols:
+            instrument = None
+            for exchange in ("NSE", "BSE"):
+                try:
+                    instrument = resolver.resolve_instrument(symbol, exchange=exchange)
+                    break
+                except Exception:
+                    continue
+            if not instrument:
+                self.unresolved_symbols.append(symbol)
+                continue
+
+            instrument_key = str(instrument.get("instrument_key") or "").strip()
+            if not instrument_key:
+                self.unresolved_symbols.append(symbol)
+                continue
+
+            self.symbol_by_instrument[instrument_key] = symbol
+            self.instrument_by_symbol[symbol] = instrument_key
+
+        if self.unresolved_symbols:
+            print(
+                "Upstox live feed could not resolve these symbols: "
+                + ", ".join(self.unresolved_symbols)
+            )
+
+        if not self.instrument_by_symbol:
+            self.error = "No Upstox instrument keys could be resolved for the watchlist."
+
+    def start(self) -> None:
+        if self.error:
+            raise RuntimeError(self.error)
+
+        configuration = upstox_client.Configuration()
+        configuration.access_token = os.getenv("UPSTOX_ACCESS_TOKEN") or ""
+        if not configuration.access_token:
+            from upstox_auth import get_valid_access_token
+
+            configuration.access_token = get_valid_access_token(force_login=False)
+
+        instrument_keys = list(self.instrument_by_symbol.values())
+        self.streamer = upstox_client.MarketDataStreamerV3(
+            upstox_client.ApiClient(configuration),
+            instrument_keys,
+            UPSTOX_LIVE_MODE,
+        )
+        self.streamer.on("open", self._on_open)
+        self.streamer.on("message", self._on_message)
+        self.streamer.on("error", self._on_error)
+        self.streamer.on("close", self._on_close)
+        self.streamer.connect()
+
+    def _on_open(self) -> None:
+        self.ready.set()
+
+    def _on_message(self, message: dict[str, object]) -> None:
+        feeds = message.get("feeds") if isinstance(message, dict) else None
+        if not isinstance(feeds, dict):
+            return
+
+        updated = False
+        with self.lock:
+            for instrument_key, feed in feeds.items():
+                symbol = self.symbol_by_instrument.get(str(instrument_key))
+                if not symbol or not isinstance(feed, dict):
+                    continue
+                ltp = _extract_upstox_ltp(feed)
+                if ltp is None:
+                    continue
+                self.latest_prices[symbol] = ltp
+                updated = True
+        if updated:
+            self.ready.set()
+
+    def _on_error(self, error: object) -> None:
+        self.error = str(error)
+        self.ready.set()
+
+    def _on_close(self, *args: object) -> None:
+        self.ready.set()
+
+    def snapshot(self) -> dict[str, float]:
+        with self.lock:
+            return dict(self.latest_prices)
+
+    def close(self) -> None:
+        if self.streamer is not None:
+            try:
+                self.streamer.disconnect()
+            except Exception:
+                pass
+
+
 def load_heatmap(conn: sqlite3.Connection, requested_symbols: list[str]) -> pd.DataFrame:
     if not table_exists(conn, HEATMAP_TABLE):
         raise RuntimeError(f"Heatmap table '{HEATMAP_TABLE}' does not exist.")
@@ -203,9 +390,22 @@ def load_heatmap(conn: sqlite3.Connection, requested_symbols: list[str]) -> pd.D
     return df.dropna(subset=["entry_rsi", "exit_rsi"]).reset_index(drop=True)
 
 
-def get_live_ltps(symbols: list[str]) -> dict[str, float]:
+def get_live_ltps(
+    symbols: list[str],
+    upstox_feed: UpstoxLivePriceFeed | None = None,
+) -> dict[str, float]:
     if not symbols:
         return {}
+
+    if upstox_feed is not None:
+        cached = upstox_feed.snapshot()
+        ltps: dict[str, float] = {}
+        for symbol in symbols:
+            ltp = cached.get(symbol)
+            if ltp is None:
+                continue
+            ltps[symbol] = round(float(ltp), 2)
+        return ltps
 
     yahoo_symbols = [f"{symbol}.NS" for symbol in symbols]
     df = yf.download(
@@ -323,10 +523,10 @@ def has_open_buy_bucket(
     return row is not None
 
 
-def get_open_buy_rows(conn: sqlite3.Connection, source_table: str) -> list[tuple[int, int, int, float]]:
+def get_open_buy_rows(conn: sqlite3.Connection, source_table: str) -> list[tuple[int, int, int, float, int | None, str | None]]:
     rows = conn.execute(
         f"""
-        SELECT id, entry_rsi, exit_rsi, ltp
+        SELECT id, entry_rsi, exit_rsi, ltp, qty, product
         FROM {quote_identifier(SIGNAL_LOG_TABLE)}
         WHERE trim(upper(source_table)) = trim(upper(?))
           AND signal_type = 'BUY'
@@ -341,6 +541,8 @@ def get_open_buy_rows(conn: sqlite3.Connection, source_table: str) -> list[tuple
             int(row[1]),
             int(row[2]),
             float(row[3]),
+            None if row[4] is None else int(row[4]),
+            None if row[5] is None else str(row[5]),
         )
         for row in rows
     ]
@@ -630,6 +832,7 @@ def insert_signal_row(conn: sqlite3.Connection, row: dict[str, object]) -> int:
             ltp,
             signal_date,
             signal_timestamp,
+            product,
             notes,
             position_state,
             buy_signal_id,
@@ -637,7 +840,7 @@ def insert_signal_row(conn: sqlite3.Connection, row: dict[str, object]) -> int:
             action_timestamp,
             closed_by_signal_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             row["source_table"],
@@ -649,6 +852,7 @@ def insert_signal_row(conn: sqlite3.Connection, row: dict[str, object]) -> int:
             row["ltp"],
             row["signal_date"],
             row["signal_timestamp"],
+            row.get("product"),
             row["notes"],
             row["position_state"],
             row["buy_signal_id"],
@@ -659,6 +863,144 @@ def insert_signal_row(conn: sqlite3.Connection, row: dict[str, object]) -> int:
     )
     conn.commit()
     return int(cursor.lastrowid)
+
+
+def trigger_order_execution(side: str, symbol: str, ltp: float) -> dict[str, object]:
+    script_path = Path(__file__).resolve().parent / "upstox_order_manager.py"
+    if not script_path.exists():
+        print(f"Skipping order execution: {script_path.name} not found.")
+        return {"success": False, "reason": "order manager not found"}
+
+    if os.getenv("UPSTOX_ALLOW_LIVE_ORDERS", "false").lower() != "true":
+        print(
+            f"Skipping order execution for {side} {symbol}: "
+            "UPSTOX_ALLOW_LIVE_ORDERS is not true."
+        )
+        return {"success": False, "reason": "live orders disabled"}
+
+    if side.upper() == "BUY":
+        try:
+            from upstox_order_manager import PER_TRADE_VALUE, UpstoxOrderManager
+
+            funds_manager = UpstoxOrderManager()
+            available_funds = funds_manager.get_available_margin()
+            print(f"Available Upstox funds: {available_funds:.2f}")
+            if available_funds < PER_TRADE_VALUE:
+                print("Funds are lower than Per trade value")
+                return {"success": False, "reason": "funds lower than per trade value"}
+        except Exception as exc:
+            print(f"Unable to read Upstox funds before BUY {symbol}: {exc}")
+            return {"success": False, "reason": str(exc)}
+
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(script_path),
+                "--side",
+                side,
+                "--symbol",
+                symbol,
+                "--ltp",
+                str(float(ltp)),
+                "--db-path",
+                str(DB_NAME),
+                "--live",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        stdout_text = completed.stdout or ""
+        stderr_text = completed.stderr or ""
+        if stdout_text:
+            print(stdout_text, end="" if stdout_text.endswith("\n") else "\n")
+        if stderr_text:
+            print(stderr_text, end="" if stderr_text.endswith("\n") else "\n")
+
+        if completed.returncode != 0:
+            print(
+                f"Upstox order manager failed for {side} {symbol} "
+                f"with exit code {completed.returncode}."
+            )
+            return {
+                "success": False,
+                "exit_code": completed.returncode,
+                "stdout": stdout_text,
+                "stderr": stderr_text,
+            }
+
+        qty = None
+        product = None
+        available_funds = None
+        order_value = None
+        for line in stdout_text.splitlines():
+            line = line.strip()
+            m = re.search(r"Calculated qty:\s*(\d+)", line)
+            if m:
+                qty = int(m.group(1))
+            m = re.search(r"Resolved SELL qty from BUY signal_id=.*:\s*(\d+)", line)
+            if m:
+                qty = int(m.group(1))
+            m = re.search(r"Resolved SELL product:\s*([A-Z]+)", line)
+            if m:
+                product = m.group(1)
+            m = re.search(r"Available Upstox funds:\s*([0-9]+(?:\.[0-9]+)?)", line)
+            if m:
+                available_funds = float(m.group(1))
+            m = re.search(r"Proposed value:\s*([0-9]+(?:\.[0-9]+)?)", line)
+            if m:
+                order_value = float(m.group(1))
+            m = re.search(r"SELL order value:\s*([0-9]+(?:\.[0-9]+)?)", line)
+            if m:
+                order_value = float(m.group(1))
+
+        return {
+            "success": True,
+            "exit_code": completed.returncode,
+            "stdout": stdout_text,
+            "stderr": stderr_text,
+            "qty": qty,
+            "product": product,
+            "available_funds": available_funds,
+            "order_value": order_value,
+        }
+    except Exception as exc:
+        print(f"Failed to launch upstox_order_manager.py for {side} {symbol}: {exc}")
+        return {"success": False, "reason": str(exc)}
+
+
+def _failure_reason_from_order_result(order_result: dict[str, object]) -> str:
+    reason = str(order_result.get("reason") or "").strip()
+    if reason:
+        return reason
+
+    stdout_text = str(order_result.get("stdout") or "").strip()
+    stderr_text = str(order_result.get("stderr") or "").strip()
+    combined = "\n".join(part for part in (stdout_text, stderr_text) if part)
+    if not combined:
+        return "order was not placed on Upstox"
+
+    explicit_markers = (
+        "Funds are lower than Per trade value",
+        "Insufficient Upstox funds",
+        "Unable to read Upstox funds",
+        "SELL orders require --signal-id",
+        "Linked BUY signal row",
+        "Insufficient live Upstox inventory",
+        "Upstox order manager failed",
+        "ValueError:",
+        "Upstox API error",
+        "Network error while calling Upstox",
+    )
+    for marker in explicit_markers:
+        if marker in combined:
+            return marker
+
+    lines = [line.strip() for line in combined.splitlines() if line.strip()]
+    if lines:
+        return lines[-1]
+    return "order was not placed on Upstox"
 
 
 def handle_source_table(
@@ -689,7 +1031,9 @@ def handle_source_table(
     )
 
     # First attempt to close any open BUY buckets with matching exit conditions.
-    for buy_id, buy_entry_rsi, buy_exit_rsi, buy_ltp in get_open_buy_rows(conn, source_table):
+    for buy_id, buy_entry_rsi, buy_exit_rsi, buy_ltp, buy_qty, buy_product in get_open_buy_rows(conn, source_table):
+        if buy_qty is None or int(buy_qty) <= 0:
+            continue
         sell_reason = get_sell_signal_reason_latest_rsi(current_rsi, buy_exit_rsi)
         alternative_bucket = None
         if not sell_reason:
@@ -726,36 +1070,56 @@ def handle_source_table(
             )
             continue
 
-        if not dry_run:
-            sell_id = insert_signal_row(
-                conn,
-                {
-                    "source_table": source_table,
-                    "signal_type": "SELL",
-                    "entry_rsi": buy_entry_rsi,
-                    "exit_rsi": buy_exit_rsi,
-                    "previous_rsi": current_rsi,
-                    "current_rsi": current_rsi,
-                    "ltp": ltp,
-                    "signal_date": signal_date,
-                    "signal_timestamp": signal_timestamp,
-                    "notes": sell_reason,
-                    "position_state": SELL_CONFIRMED_STATE,
-                    "buy_signal_id": buy_id,
-                    "trigger_exit_rsi": buy_exit_rsi,
-                    "action_timestamp": signal_timestamp,
-                    "closed_by_signal_id": None,
-                },
-            )
-            close_buy_bucket(conn, buy_id, sell_id, signal_timestamp)
-        else:
-            sell_id = None
-
+        qty = int(buy_qty)
+        pnl = round((float(ltp) - float(buy_ltp)) * float(qty), 2)
+        pnl_pct = round(((float(ltp) - float(buy_ltp)) / float(buy_ltp)) * 100.0, 4) if float(buy_ltp) else 0.0
         message = (
             f"SELL {source_table} | closed_buy_id={buy_id} | bucket=({buy_entry_rsi},{buy_exit_rsi}) | "
-            f"RSI {current_rsi:.2f} | LTP {ltp:.2f}"
+            f"BUY LTP {buy_ltp:.2f} | SELL LTP {ltp:.2f} | Qty {qty} | PnL {pnl:.2f} ({pnl_pct:.4f}%) | "
+            f"RSI {current_rsi:.2f}"
         )
         print(message)
+        if dry_run:
+            if send_to_telegram:
+                ok = send_telegram_message(message, bot_token=telegram_bot_token, chat_id=telegram_chat_id)
+                if not ok:
+                    print("Telegram alert not delivered for SELL signal.")
+            return
+
+        order_result = trigger_order_execution("SELL", source_table, ltp)
+        if not order_result.get("success"):
+            fail_reason = _failure_reason_from_order_result(order_result)
+            fail_message = f"SELL {source_table} skipped: {fail_reason}."
+            print(fail_message)
+            if send_to_telegram:
+                ok = send_telegram_message(fail_message, bot_token=telegram_bot_token, chat_id=telegram_chat_id)
+                if not ok:
+                    print("Telegram alert not delivered for SELL signal.")
+            return
+
+        sell_id = insert_signal_row(
+            conn,
+            {
+                "source_table": source_table,
+                "signal_type": "SELL",
+                "entry_rsi": buy_entry_rsi,
+                "exit_rsi": buy_exit_rsi,
+                "previous_rsi": current_rsi,
+                "current_rsi": current_rsi,
+                "ltp": ltp,
+                "qty": qty,
+                "product": buy_product,
+                "signal_date": signal_date,
+                "signal_timestamp": signal_timestamp,
+                "notes": f"{sell_reason} | BUY_LTP={buy_ltp:.2f} | PnL={pnl:.2f}",
+                "position_state": SELL_CONFIRMED_STATE,
+                "buy_signal_id": buy_id,
+                "trigger_exit_rsi": buy_exit_rsi,
+                "action_timestamp": signal_timestamp,
+                "closed_by_signal_id": None,
+            },
+        )
+        close_buy_bucket(conn, buy_id, sell_id, signal_timestamp)
         if send_to_telegram:
             ok = send_telegram_message(message, bot_token=telegram_bot_token, chat_id=telegram_chat_id)
             if not ok:
@@ -802,31 +1166,54 @@ def handle_source_table(
             )
             continue
 
-        if not dry_run:
-            insert_signal_row(
-                conn,
-                {
-                    "source_table": source_table,
-                    "signal_type": "BUY",
-                    "entry_rsi": entry_rsi,
-                    "exit_rsi": exit_rsi,
-                    "previous_rsi": current_rsi,
-                    "current_rsi": current_rsi,
-                    "ltp": ltp,
-                    "signal_date": signal_date,
-                    "signal_timestamp": signal_timestamp,
-                    "notes": buy_reason,
-                    "position_state": BUY_OPEN_STATE,
-                    "buy_signal_id": None,
-                    "trigger_exit_rsi": None,
-                    "action_timestamp": None,
-                    "closed_by_signal_id": None,
-                },
-            )
         message = (
             f"BUY {source_table} | bucket=({entry_rsi},{exit_rsi}) | RSI {current_rsi:.2f} | LTP {ltp:.2f}"
         )
         print(message)
+        if dry_run:
+            if send_to_telegram:
+                ok = send_telegram_message(message, bot_token=telegram_bot_token, chat_id=telegram_chat_id)
+                if not ok:
+                    print("Telegram alert not delivered for BUY signal.")
+            return
+
+        order_result = trigger_order_execution("BUY", source_table, ltp)
+        if not order_result.get("success"):
+            fail_reason = _failure_reason_from_order_result(order_result)
+            fail_message = f"BUY {source_table} skipped: {fail_reason}."
+            print(fail_message)
+            if send_to_telegram:
+                ok = send_telegram_message(fail_message, bot_token=telegram_bot_token, chat_id=telegram_chat_id)
+                if not ok:
+                    print("Telegram alert not delivered for BUY signal.")
+            return
+
+        buy_qty = order_result.get("qty")
+        if buy_qty is None:
+            buy_qty = max(1, int(PER_TRADE_VALUE // float(ltp)))
+        buy_product = order_result.get("product") or "D"
+        buy_id = insert_signal_row(
+            conn,
+            {
+                "source_table": source_table,
+                "signal_type": "BUY",
+                "entry_rsi": entry_rsi,
+                "exit_rsi": exit_rsi,
+                "previous_rsi": current_rsi,
+                "current_rsi": current_rsi,
+                "ltp": ltp,
+                "qty": int(buy_qty),
+                "product": str(buy_product),
+                "signal_date": signal_date,
+                "signal_timestamp": signal_timestamp,
+                "notes": buy_reason,
+                "position_state": BUY_OPEN_STATE,
+                "buy_signal_id": None,
+                "trigger_exit_rsi": None,
+                "action_timestamp": None,
+                "closed_by_signal_id": None,
+            },
+        )
         if send_to_telegram:
             ok = send_telegram_message(message, bot_token=telegram_bot_token, chat_id=telegram_chat_id)
             if not ok:
@@ -871,6 +1258,25 @@ def main() -> None:
     print("-" * 48 + "\n")
     interval_seconds = max(5, args.interval)
     requested_symbols = [symbol.strip().upper() for symbol in (args.symbols or []) if symbol.strip()]
+    live_feed: UpstoxLivePriceFeed | None = None
+    active_upstox_symbols: set[str] = set()
+
+    if args.upstox_live and upstox_client is None:
+        raise RuntimeError(
+            "The Upstox SDK is required for --upstox-live. Install it with: pip install upstox-python-sdk"
+        )
+
+    if args.upstox_live:
+        try:
+            from upstox_order_manager import UpstoxOrderManager
+
+            funds_manager = UpstoxOrderManager()
+            available_funds = funds_manager.get_available_margin()
+            print(f"Available Upstox funds: {available_funds:.2f}")
+            print("-" * 48 + "\n")
+        except Exception as exc:
+            print(f"Unable to read Upstox available funds at startup: {exc}")
+            print("-" * 48 + "\n")
 
     conn = sqlite3.connect(DB_NAME)
     try:
@@ -892,11 +1298,38 @@ def main() -> None:
                 continue
 
             symbols = sorted(heatmap_df["source_table"].dropna().unique().tolist())
-            ltps = get_live_ltps(symbols)
+            if args.upstox_live:
+                current_upstox_symbols = set(symbols)
+                if live_feed is None or current_upstox_symbols != active_upstox_symbols:
+                    if live_feed is not None:
+                        live_feed.close()
+                    live_feed = UpstoxLivePriceFeed(symbols)
+                    live_feed.start()
+                    if live_feed.error:
+                        raise RuntimeError(live_feed.error)
+                    if not live_feed.ready.wait(timeout=15):
+                        raise RuntimeError(
+                            "Timed out waiting for the Upstox market-data websocket."
+                        )
+                    active_upstox_symbols = current_upstox_symbols
+                    print(
+                        f"Upstox websocket connected for {len(active_upstox_symbols)} symbols."
+                    )
+                    time.sleep(2)
+                    continue
+
+            ltps = get_live_ltps(symbols, live_feed if args.upstox_live else None)
             if not ltps:
                 print("Unable to fetch live prices. Retrying.")
                 time.sleep(interval_seconds)
                 continue
+
+            if getattr(args, "dry_run", False):
+                snapshot = ", ".join(
+                    f"{symbol}={ltp:.2f}"
+                    for symbol, ltp in sorted(ltps.items())
+                )
+                print(f"Live price snapshot: {snapshot}")
 
             now = datetime.now()
             signal_date = now.strftime("%Y-%m-%d")
@@ -933,6 +1366,8 @@ def main() -> None:
 
             time.sleep(interval_seconds)
     finally:
+        if live_feed is not None:
+            live_feed.close()
         conn.close()
 
 
