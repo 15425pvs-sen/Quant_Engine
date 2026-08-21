@@ -1923,7 +1923,7 @@ def main() -> None:
     print(f"Interval: {getattr(args, 'interval', DEFAULT_INTERVAL_SECONDS)}s   Symbols: {symbols_display}")
     print(f"Confirm order: {getattr(args, 'confirmOrder', False)}")
     print(f"Telegram: {'ENABLED' if getattr(args, 'telegram', False) else 'DISABLED'}  token_sample={bot_sample} chat_sample={chat_sample}")
-    print("BUY sizing: uses available funds and DAILY_LIMIT; no hard PER_TRADE_VALUE precheck.")
+    print("BUY sizing: PER_TRADE_VALUE is the maximum order cap, with DAILY_LIMIT and available funds checks.")
     print(f"Active protections: {', '.join(protections) if protections else 'None'}")
     print("-" * 48 + "\n")
     interval_seconds = max(5, args.interval)
