@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import sqlite3
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -39,12 +40,13 @@ BASE_URL = "https://api.upstox.com/v2"
 FUNDS_URL = f"{BASE_URL}/user/get-funds-and-margin"
 FUNDS_URL_V3 = "https://api.upstox.com/v3/user/get-funds-and-margin"
 ORDER_URL_V3 = "https://api-hft.upstox.com/v3/order/place"
+CONVERT_POSITION_URL = f"{BASE_URL}/portfolio/convert-position"
 DEFAULT_TIMEOUT = 30
 DB_PATH = Path(__file__).resolve().parent / "quant_historic_data.db"
 SIGNAL_LOG_TABLE = "rsi_live_signal_log_trading"
 DAILY_USAGE_FILE = Path(__file__).resolve().parent / "upstox_daily_usage.json"
-PER_TRADE_VALUE = 1500.0
-DAILY_LIMIT = 10000.0
+PER_TRADE_VALUE = 4000.0
+DAILY_LIMIT = 20000.0
 BUY_FUNDS_BUFFER_PCT = 0.0
 
 
@@ -67,8 +69,34 @@ def get_today_usage() -> tuple[str, float]:
         return today, 0.0
 
     usage_date = str(data.get("date", today))
+    if usage_date != today:
+        return today, 0.0
     used_value = float(data.get("used_value", 0.0) or 0.0)
     return usage_date, used_value
+
+
+def get_today_rejects() -> tuple[str, list[str]]:
+    today = _today_key()
+    if not DAILY_USAGE_FILE.exists():
+        return today, []
+
+    try:
+        with DAILY_USAGE_FILE.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return today, []
+
+    if not isinstance(data, dict):
+        return today, []
+
+    usage_date = str(data.get("date", today))
+    if usage_date != today:
+        return today, []
+    rejects_raw = data.get("reject_list", [])
+    if not isinstance(rejects_raw, list):
+        rejects_raw = []
+    rejects = sorted({str(item).strip().upper() for item in rejects_raw if str(item).strip()})
+    return usage_date, rejects
 
 
 def save_today_usage(date_str: str, used_value: float) -> None:
@@ -76,8 +104,40 @@ def save_today_usage(date_str: str, used_value: float) -> None:
         "date": date_str,
         "used_value": round(float(used_value), 2),
     }
+    _, rejects = get_today_rejects()
+    payload["reject_list"] = rejects
     with DAILY_USAGE_FILE.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
+
+
+def add_today_reject(symbol: str) -> None:
+    symbol = str(symbol).strip().upper()
+    if not symbol:
+        return
+
+    today = _today_key()
+    _, used_today = get_today_usage()
+    _, rejects = get_today_rejects()
+    rejects_set = {item.upper() for item in rejects}
+    rejects_set.add(symbol)
+    payload = {
+        "date": today,
+        "used_value": round(float(used_today), 2),
+        "reject_list": sorted(rejects_set),
+    }
+    with DAILY_USAGE_FILE.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+
+def is_today_rejected(symbol: str) -> bool:
+    symbol = str(symbol).strip().upper()
+    if not symbol:
+        return False
+
+    usage_date, rejects = get_today_rejects()
+    if usage_date != _today_key():
+        return False
+    return symbol in {item.upper() for item in rejects}
 
 
 def estimate_trade_quantity(ltp: float, per_trade_value: float) -> tuple[int, float]:
@@ -91,7 +151,11 @@ def estimate_trade_quantity(ltp: float, per_trade_value: float) -> tuple[int, fl
     return qty, float(qty * ltp)
 
 
-def validate_trade_amount(symbol: str, ltp: float) -> tuple[int, float, float]:
+def validate_trade_amount(
+    symbol: str,
+    ltp: float,
+    available_margin: float | None = None,
+) -> tuple[int, float, float]:
     if ltp <= 0:
         raise ValueError("ltp must be greater than zero.")
     if PER_TRADE_VALUE <= 0:
@@ -99,24 +163,24 @@ def validate_trade_amount(symbol: str, ltp: float) -> tuple[int, float, float]:
     if DAILY_LIMIT <= 0:
         raise ValueError("DAILY_LIMIT must be greater than zero.")
 
-    qty, order_value = estimate_trade_quantity(ltp, PER_TRADE_VALUE)
-    if qty <= 0:
-        raise ValueError(
-            f"Order quantity came out to zero for {symbol} at LTP {ltp:.2f} "
-            f"and PER_TRADE_VALUE {PER_TRADE_VALUE:.2f}."
-        )
-
     usage_date, used_today = get_today_usage()
     today = _today_key()
     if usage_date != today:
         used_today = 0.0
 
     remaining_today = max(0.0, DAILY_LIMIT - used_today)
-    if order_value > remaining_today:
+
+    available_budget = max(0.0, float(available_margin)) if available_margin is not None else PER_TRADE_VALUE
+    spend_budget = min(float(PER_TRADE_VALUE), remaining_today, available_budget)
+    qty = int(spend_budget // ltp)
+    if qty <= 0:
         raise ValueError(
-            f"This trade would exceed today's remaining allocation. "
-            f"Order value {order_value:.2f} > remaining {remaining_today:.2f}."
+            f"Order quantity came out to zero for {symbol} at LTP {ltp:.2f}. "
+            f"PER_TRADE_VALUE {PER_TRADE_VALUE:.2f}, remaining {remaining_today:.2f}, "
+            f"available_funds {available_budget:.2f}."
         )
+
+    order_value = float(qty * ltp)
 
     return qty, order_value, used_today
 
@@ -230,27 +294,60 @@ def update_signal_execution_details(
         )
         return False
 
-    try:
-        with sqlite3.connect(db_path) as conn:
-            ensure_signal_qty_column(conn)
-            cursor = conn.execute(
-                f"UPDATE {SIGNAL_LOG_TABLE} SET qty = ?, product = ? WHERE id = ?",
-                (int(qty), product, int(signal_id)),
-            )
-            conn.commit()
-            if cursor.rowcount <= 0:
-                print(
-                    f"Warning: execution detail update affected no rows for "
-                    f"signal_id={signal_id}."
+    last_exc: Exception | None = None
+    desired_qty = int(qty)
+    desired_product = product
+    for attempt in range(1, 6):
+        try:
+            with sqlite3.connect(db_path, timeout=30) as conn:
+                conn.execute("PRAGMA busy_timeout = 30000")
+                conn.execute("PRAGMA journal_mode = WAL")
+                ensure_signal_qty_column(conn)
+                cursor = conn.execute(
+                    f"UPDATE {SIGNAL_LOG_TABLE} SET qty = ?, product = ? WHERE id = ?",
+                    (desired_qty, desired_product, int(signal_id)),
                 )
-                return False
-            return True
-    except sqlite3.Error as exc:
-        print(
-            f"Warning: failed to update execution details for "
-            f"signal_id={signal_id}: {exc}"
-        )
-        return False
+                conn.commit()
+                if cursor.rowcount <= 0:
+                    print(
+                        f"Warning: execution detail update affected no rows for "
+                        f"signal_id={signal_id}."
+                    )
+                    return False
+                return True
+        except sqlite3.OperationalError as exc:
+            last_exc = exc
+            if "locked" not in str(exc).lower() or attempt >= 5:
+                break
+            continue
+        except sqlite3.Error as exc:
+            last_exc = exc
+            break
+
+    try:
+        for _ in range(10):
+            with sqlite3.connect(db_path, timeout=30) as conn:
+                conn.execute("PRAGMA busy_timeout = 30000")
+                conn.execute("PRAGMA journal_mode = WAL")
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    f"SELECT qty, product FROM {SIGNAL_LOG_TABLE} WHERE id = ?",
+                    (int(signal_id),),
+                ).fetchone()
+                if row is not None:
+                    current_qty = row["qty"]
+                    current_product = row["product"]
+                    if int(current_qty or 0) == desired_qty and str(current_product or "") == str(desired_product or ""):
+                        return True
+            time.sleep(0.25)
+    except sqlite3.Error:
+        pass
+
+    print(
+        f"Warning: failed to update execution details for "
+        f"signal_id={signal_id}: {last_exc}"
+    )
+    return False
 
 
 def fetch_signal_row(
@@ -266,7 +363,8 @@ def fetch_signal_row(
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 f"""
-                SELECT id, source_table, signal_type, qty, product, buy_signal_id, position_state
+                SELECT id, source_table, signal_type, qty, product, buy_signal_id, position_state,
+                       signal_date, signal_timestamp, action_timestamp, closed_by_signal_id
                 FROM {SIGNAL_LOG_TABLE}
                 WHERE id = ?
                 """,
@@ -288,9 +386,25 @@ def resolve_sell_quantity(
             f"SELL signal row {sell_signal_id} not found in {db_path}."
         )
 
-    if str(sell_row.get("signal_type", "")).upper() != "SELL":
+    signal_type = str(sell_row.get("signal_type", "")).upper()
+    if signal_type == "BUY":
+        qty_raw = sell_row.get("qty")
+        try:
+            qty = int(qty_raw or 0)
+        except (TypeError, ValueError):
+            qty = 0
+
+        if qty <= 0:
+            raise ValueError(
+                f"BUY signal row {sell_signal_id} has no valid qty."
+            )
+
+        product = sell_row.get("product")
+        return qty, int(sell_signal_id), str(product) if product else None
+
+    if signal_type != "SELL":
         raise ValueError(
-            f"Signal row {sell_signal_id} is not a SELL row."
+            f"Signal row {sell_signal_id} is not a BUY or SELL row."
         )
 
     buy_signal_id = int(sell_row.get("buy_signal_id") or 0)
@@ -328,6 +442,21 @@ def resolve_sell_quantity(
 
 def _normalize_text(value: Any) -> str:
     return str(value or "").strip().upper()
+
+
+def _parse_signal_date(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(raw[:19], fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def _row_matches_symbol(
@@ -762,16 +891,59 @@ class UpstoxOrderManager:
         )
         return payload.get("data", [])
 
+    def convert_position(
+        self,
+        symbol: str,
+        exchange: str,
+        quantity: int,
+        old_product: str,
+        new_product: str,
+        transaction_type: str = "BUY",
+    ) -> Dict[str, Any]:
+        instrument = self.resolve_instrument(symbol, exchange)
+        payload = {
+            "instrument_token": instrument["instrument_key"],
+            "old_product": old_product.upper(),
+            "new_product": new_product.upper(),
+            "transaction_type": transaction_type.upper(),
+            "quantity": int(quantity),
+        }
+        if not self.allow_live_orders:
+            print("\nLIVE POSITION CONVERSION BLOCKED")
+            print(
+                "Set UPSTOX_ALLOW_LIVE_ORDERS=true only when you are "
+                "ready to submit real position conversion requests."
+            )
+            print("\nResolved instrument:")
+            print(f"  Symbol          : {instrument.get('trading_symbol')}")
+            print(f"  Instrument key  : {instrument['instrument_key']}")
+            print("\nConvert payload:")
+            print(payload)
+            return {
+                "status": "DRY_RUN",
+                "instrument": instrument,
+                "conversion": payload,
+            }
+
+        return self._request(
+            "PUT",
+            CONVERT_POSITION_URL,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+        )
+
     def resolve_live_sell_inventory(
         self,
         symbol: str,
         exchange: str,
         required_qty: int,
         preferred_product: str | None = None,
+        trade_dt: datetime | None = None,
     ) -> tuple[str, int, str]:
         positions = self.get_positions()
         holdings = self.get_holdings()
         product_filter = _normalize_text(preferred_product) or None
+        same_day_trade = trade_dt is not None and trade_dt.date() == datetime.now().date()
 
         positions_qty = _available_positions_quantity(
             positions,
@@ -795,11 +967,26 @@ class UpstoxOrderManager:
             )
 
         if product_filter == "D":
+            if same_day_trade:
+                if positions_qty >= required_qty:
+                    return "D", positions_qty, "positions"
+                raise UpstoxOrderError(
+                    f"Insufficient live same-day positions for {symbol} on {exchange}. "
+                    f"Required {required_qty}, positions available {positions_qty}."
+                )
             if holdings_qty >= required_qty:
                 return "D", holdings_qty, "holdings"
             raise UpstoxOrderError(
                 f"Insufficient live delivery holdings for {symbol} on {exchange}. "
                 f"Required {required_qty}, holdings available {holdings_qty}."
+            )
+
+        if same_day_trade:
+            if positions_qty >= required_qty:
+                return "I", positions_qty, "positions"
+            raise UpstoxOrderError(
+                f"Insufficient live same-day positions for {symbol} on {exchange}. "
+                f"Required {required_qty}, positions available {positions_qty}."
             )
 
         if positions_qty >= required_qty:
@@ -887,6 +1074,11 @@ def main() -> None:
         action="store_true",
         help="Allow real order submission for this invocation",
     )
+    parser.add_argument(
+        "--confirm-order",
+        action="store_true",
+        help="Prompt for Y/N after validation checks and before placing the order.",
+    )
 
     args = parser.parse_args()
 
@@ -907,13 +1099,20 @@ def main() -> None:
         raise UpstoxOrderError(f"Unable to read Upstox available funds: {exc}") from exc
 
     print(f"Available Upstox funds: {available_margin:.2f}")
-    if available_margin < PER_TRADE_VALUE:
-        print("Funds are lower than Per trade value")
-        return
 
     if args.side == "BUY":
+        if is_today_rejected(args.symbol):
+            print(f"BUY {args.symbol} skipped: symbol declined earlier today.")
+            return
+        if available_margin < PER_TRADE_VALUE:
+            print("Funds are lower than Per trade value")
+            return
         try:
-            qty, order_value, used_today = validate_trade_amount(args.symbol, args.ltp)
+            qty, order_value, used_today = validate_trade_amount(
+                args.symbol,
+                args.ltp,
+                available_margin=available_margin,
+            )
             available_margin, live_order_value = manager.ensure_buy_funds_available(
                 args.symbol,
                 qty,
@@ -944,12 +1143,73 @@ def main() -> None:
                 args.signal_id,
                 db_path=db_path,
             )
-            resolved_sell_product, live_available_qty, inventory_source = manager.resolve_live_sell_inventory(
-                args.symbol,
-                args.exchange,
-                qty,
-                preferred_product=linked_buy_product,
+            linked_buy_row = fetch_signal_row(linked_buy_signal_id, db_path=db_path)
+            linked_buy_product = str(linked_buy_product or "").upper() or None
+            linked_buy_dt = _parse_signal_date((linked_buy_row or {}).get("signal_timestamp"))
+            if linked_buy_dt is None:
+                linked_buy_dt = _parse_signal_date((linked_buy_row or {}).get("action_timestamp"))
+            if linked_buy_dt is None:
+                linked_buy_dt = _parse_signal_date((linked_buy_row or {}).get("signal_date"))
+            today_key = datetime.now().date()
+            should_convert_same_day = (
+                linked_buy_product == "D"
+                and linked_buy_dt is not None
+                and linked_buy_dt.date() == today_key
             )
+
+            if should_convert_same_day and manager.allow_live_orders:
+                positions = manager.get_positions()
+                live_same_day_qty = _available_positions_quantity(
+                    positions,
+                    args.symbol,
+                    args.exchange,
+                    product="D",
+                )
+                if live_same_day_qty <= 0:
+                    raise UpstoxOrderError(
+                        f"Insufficient live same-day positions for {args.symbol} on {args.exchange}. "
+                        f"Required {qty}, positions available {live_same_day_qty}."
+                    )
+                if live_same_day_qty < qty:
+                    print(
+                        f"Same-day SELL quantity {qty} exceeds live same-day positions "
+                        f"{live_same_day_qty}; using available quantity."
+                    )
+                    qty = live_same_day_qty
+
+                try:
+                    conversion_result = manager.convert_position(
+                        args.symbol,
+                        args.exchange,
+                        qty,
+                        old_product="D",
+                        new_product="I",
+                        transaction_type="BUY",
+                    )
+                    print(
+                        f"Converted same-day delivery position to intraday for {args.symbol} "
+                        f"before SELL."
+                    )
+                    if conversion_result.get("status") != "DRY_RUN":
+                        print(f"Conversion response: {conversion_result}")
+                except UpstoxOrderError as exc:
+                    print(
+                        f"SELL {args.symbol} skipped: unable to convert same-day "
+                        f"delivery position to intraday: {exc}"
+                    )
+                    return
+
+                resolved_sell_product = "I"
+                live_available_qty = qty
+                inventory_source = "converted"
+            else:
+                resolved_sell_product, live_available_qty, inventory_source = manager.resolve_live_sell_inventory(
+                    args.symbol,
+                    args.exchange,
+                    qty,
+                    preferred_product=linked_buy_product,
+                    trade_dt=linked_buy_dt,
+                )
             order_value = float(qty) * float(args.ltp)
             print(
                 f"Resolved SELL qty from BUY signal_id={linked_buy_signal_id}: {qty}"
@@ -967,6 +1227,40 @@ def main() -> None:
             return
         except UpstoxOrderError as exc:
             print(f"SELL {args.symbol} skipped: {exc}")
+            return
+
+    if args.confirm_order:
+        try:
+            if args.side == "BUY":
+                prompt = (
+                    f"Confirm Upstox BUY order for {args.symbol} | "
+                    f"qty={qty} | order_value={order_value:.2f} | "
+                    f"available_funds={available_margin:.2f} | "
+                    f"remaining_daily_limit={max(0.0, DAILY_LIMIT - used_today):.2f} ? [Y/N]: "
+                )
+            else:
+                prompt = (
+                    f"Confirm Upstox SELL order for {args.symbol} | "
+                    f"qty={qty} | order_value={order_value:.2f} | "
+                    f"linked_buy_signal_id={linked_buy_signal_id} | "
+                    f"live_inventory={resolved_sell_product or args.product} ? [Y/N]: "
+                )
+            while True:
+                print(prompt, end="", flush=True)
+                response = input().strip().upper()
+                if response in {"Y", "N"}:
+                    break
+                print("Please type Y or N.")
+        except EOFError:
+            print(
+                f"Skipping {args.side} {args.symbol}: confirmation input unavailable."
+            )
+            return
+
+        if response == "N":
+            print(f"Skipping {args.side} {args.symbol}: user declined confirmation.")
+            if args.side == "BUY":
+                add_today_reject(args.symbol)
             return
 
     kwargs = {
@@ -993,20 +1287,10 @@ def main() -> None:
     if result.get("status") == "DRY_RUN":
         return
 
-    if args.side == "BUY":
-        update_daily_usage(order_value)
+    order_submitted = bool(result) and result.get("status") != "DRY_RUN"
 
-    if args.signal_id is not None:
-        if update_signal_execution_details(
-            args.signal_id,
-            qty,
-            resolved_sell_product if args.side == "SELL" else args.product,
-            db_path=db_path,
-        ):
-            print(
-                f"Updated {SIGNAL_LOG_TABLE} for signal_id={args.signal_id} "
-                f"with qty={qty}."
-            )
+    if args.side == "BUY" and order_submitted:
+        update_daily_usage(order_value)
 
 
 if __name__ == "__main__":

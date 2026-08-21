@@ -10,8 +10,9 @@ Usage:
     py live_rsi_tracking.py --hybrid
     py live_rsi_tracking.py --hybrid --interval 15
     py live_rsi_tracking.py --hybrid --results
-    py live_rsi_tracking.py --hybrid --telegram
-    py live_rsi_tracking.py --hybrid --buy-rsi-protection 1.0 --min-profit-pct 0.05 --telegram
+    py live_rsi_tracking.py --hybrid --telegram --confirmOrder
+    py live_rsi_tracking.py --hybrid --buy-rsi-protection 1.0 --telegram --confirmOrder
+    >py live_rsi_tracking.py --hybrid --telegram --confirmOrder --buy-rsi-protection 1.0
 
 $env:UPSTOX_ALLOW_LIVE_ORDERS="true"
 py live_rsi_tracking.py --hybrid --telegram
@@ -48,9 +49,14 @@ except ImportError as exc:
 DB_NAME = Path(__file__).resolve().parent / "quant_historic_data.db"
 HEATMAP_TABLE = "rsi_heatmap_data_for_trading"
 SIGNAL_LOG_TABLE = "rsi_live_signal_log_trading"
+ALL_SIGNAL_LOG_TABLE = "rsi_live_signal_log_trading_all_signals"
 LTP_HISTORY_PERIOD = "5d"
 LTP_INTERVAL = "1m"
 DEFAULT_INTERVAL_SECONDS = 30
+MARKET_OPEN_HOUR = 9
+MARKET_OPEN_MINUTE = 20
+MARKET_CLOSE_HOUR = 15
+MARKET_CLOSE_MINUTE = 30
 
 BUY_OPEN_STATE = "OPEN"
 BUY_CLOSED_STATE = "CLOSED"
@@ -138,6 +144,11 @@ def parse_args() -> argparse.Namespace:
         help="Minimum difference required between exit RSI and current RSI to allow a BUY (e.g. 1.0).",
     )
     parser.add_argument(
+        "--confirmOrder",
+        action="store_true",
+        help="Prompt for Y/N before placing each Upstox order.",
+    )
+    parser.add_argument(
         "--upstox-live",
         action="store_true",
         default=True,
@@ -150,6 +161,14 @@ def parse_args() -> argparse.Namespace:
         help="Disable the Upstox websocket feed and fall back to yfinance polling.",
     )
     return parser.parse_args()
+
+
+def is_market_open_now(now: datetime | None = None) -> bool:
+    now = now or datetime.now()
+    current_minutes = now.hour * 60 + now.minute
+    open_minutes = MARKET_OPEN_HOUR * 60 + MARKET_OPEN_MINUTE
+    close_minutes = MARKET_CLOSE_HOUR * 60 + MARKET_CLOSE_MINUTE
+    return open_minutes <= current_minutes <= close_minutes
 
 
 def ensure_signal_log_table(conn: sqlite3.Connection) -> None:
@@ -191,6 +210,46 @@ def ensure_signal_log_table(conn: sqlite3.Connection) -> None:
         )
     conn.execute(
         f"""
+        CREATE TABLE IF NOT EXISTS {quote_identifier(ALL_SIGNAL_LOG_TABLE)} (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_table      TEXT NOT NULL,
+            signal_type       TEXT NOT NULL,
+            entry_rsi         INTEGER NOT NULL,
+            exit_rsi          INTEGER NOT NULL,
+            previous_rsi      REAL NOT NULL,
+            current_rsi       REAL NOT NULL,
+            ltp               REAL NOT NULL,
+            qty               INTEGER,
+            product           TEXT,
+            signal_date       TEXT NOT NULL,
+            signal_timestamp  TEXT NOT NULL,
+            notes             TEXT,
+            position_state    TEXT NOT NULL DEFAULT 'OPEN',
+            buy_signal_id     INTEGER,
+            trigger_exit_rsi  INTEGER,
+            action_timestamp  TEXT,
+            closed_by_signal_id INTEGER,
+            order_status      TEXT,
+            order_reason      TEXT
+        )
+        """
+    )
+    all_existing_cols = {
+        str(row[1]).lower()
+        for row in conn.execute(f"PRAGMA table_info({quote_identifier(ALL_SIGNAL_LOG_TABLE)})")
+    }
+    for column_name, column_type in (
+        ("qty", "INTEGER"),
+        ("product", "TEXT"),
+        ("order_status", "TEXT"),
+        ("order_reason", "TEXT"),
+    ):
+        if column_name not in all_existing_cols:
+            conn.execute(
+                f"ALTER TABLE {quote_identifier(ALL_SIGNAL_LOG_TABLE)} ADD COLUMN {column_name} {column_type}"
+            )
+    conn.execute(
+        f"""
         CREATE INDEX IF NOT EXISTS idx_{SIGNAL_LOG_TABLE}_lookup
         ON {quote_identifier(SIGNAL_LOG_TABLE)} (source_table, entry_rsi, exit_rsi, signal_timestamp)
         """
@@ -203,6 +262,23 @@ def ensure_signal_log_table(conn: sqlite3.Connection) -> None:
             entry_rsi
         )
         WHERE signal_type = 'BUY'
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE INDEX IF NOT EXISTS idx_{ALL_SIGNAL_LOG_TABLE}_lookup
+        ON {quote_identifier(ALL_SIGNAL_LOG_TABLE)} (source_table, signal_type, signal_timestamp)
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_{ALL_SIGNAL_LOG_TABLE}_unique_bucket
+        ON {quote_identifier(ALL_SIGNAL_LOG_TABLE)} (
+            trim(upper(source_table)),
+            signal_type,
+            entry_rsi,
+            exit_rsi
+        )
         """
     )
     conn.commit()
@@ -479,6 +555,35 @@ def load_latest_rsi(conn: sqlite3.Connection, table_name: str) -> tuple[float | 
     )
 
 
+def load_close_history(conn: sqlite3.Connection, table_name: str, limit: int = 250) -> pd.DataFrame:
+    if not table_exists(conn, table_name):
+        return pd.DataFrame(columns=["trade_date", "close"])
+
+    df = pd.read_sql(
+        f"""
+        SELECT trade_date, close
+        FROM {quote_identifier(table_name)}
+        WHERE close IS NOT NULL
+        ORDER BY trade_date DESC
+        LIMIT ?
+        """,
+        conn,
+        params=(int(limit),),
+    )
+    if df.empty:
+        return df
+
+    df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
+    df["close"] = pd.to_numeric(
+        df["close"].astype(str).str.replace(",", "", regex=False).str.strip(),
+        errors="coerce",
+    )
+    df = df.dropna(subset=["trade_date", "close"]).reset_index(drop=True)
+    if not df.empty:
+        df = df.sort_values(by="trade_date", ascending=True).reset_index(drop=True)
+    return df
+
+
 def get_latest_signal_bucket_exists(
     conn: sqlite3.Connection,
     source_table: str,
@@ -644,6 +749,7 @@ def get_trade_results(conn: sqlite3.Connection) -> pd.DataFrame:
             buy_signal_id,
             ltp,
             signal_timestamp,
+            qty,
             position_state
         FROM {quote_identifier(SIGNAL_LOG_TABLE)}
         WHERE signal_type = 'SELL'
@@ -653,7 +759,7 @@ def get_trade_results(conn: sqlite3.Connection) -> pd.DataFrame:
         """
     sell_rows = pd.read_sql(query, conn)
     if sell_rows.empty:
-        return pd.DataFrame(columns=["source_table", "trades", "entry_price", "exit_price", "pnl_pct"])
+        return pd.DataFrame(columns=["source_table", "trades", "entry_price", "exit_price", "pnl_pct", "pnl_abs"])
 
     results: list[dict[str, object]] = []
     for _, row in sell_rows.iterrows():
@@ -672,26 +778,35 @@ def get_trade_results(conn: sqlite3.Connection) -> pd.DataFrame:
 
         entry_price = float(buy_row.iloc[0]["ltp"])
         exit_price = float(row["ltp"])
+        qty = int(row["qty"] or 0)
         if entry_price <= 0:
             continue
 
         pnl_pct = ((exit_price - entry_price) / entry_price) * 100.0
+        pnl_abs = (exit_price - entry_price) * qty
         results.append(
             {
                 "source_table": str(row["source_table"]).strip().upper(),
                 "entry_price": entry_price,
                 "exit_price": exit_price,
                 "pnl_pct": round(float(pnl_pct), 2),
+                "pnl_abs": round(float(pnl_abs), 2),
             }
         )
 
     if not results:
-        return pd.DataFrame(columns=["source_table", "trades", "entry_price", "exit_price", "pnl_pct"])
+        return pd.DataFrame(columns=["source_table", "trades", "entry_price", "exit_price", "pnl_pct", "pnl_abs"])
 
     results_df = pd.DataFrame(results)
     summary = (
         results_df.groupby("source_table", sort=True)
-        .agg(trades=("pnl_pct", "size"), entry_price=("entry_price", "mean"), exit_price=("exit_price", "mean"), pnl_pct=("pnl_pct", "mean"))
+        .agg(
+            trades=("pnl_pct", "size"),
+            entry_price=("entry_price", "mean"),
+            exit_price=("exit_price", "mean"),
+            pnl_pct=("pnl_pct", "mean"),
+            pnl_abs=("pnl_abs", "sum"),
+        )
         .reset_index()
     )
     summary = summary.sort_values(by=["pnl_pct", "source_table"], ascending=[False, True]).reset_index(drop=True)
@@ -708,12 +823,14 @@ def print_trade_results(conn: sqlite3.Connection) -> None:
     print("-" * 60)
     for _, row in results_df.iterrows():
         print(
-            f"{str(row['source_table']).upper():<12} trades={int(row['trades']):>2}  P&L%={float(row['pnl_pct']):>8.2f}"
+            f"{str(row['source_table']).upper():<12} trades={int(row['trades']):>2}  "
+            f"P&L={float(row['pnl_abs']):>10.2f}  P&L%={float(row['pnl_pct']):>8.2f}"
         )
 
     overall_pnl = round(float(results_df["pnl_pct"].mean()), 2)
+    overall_abs_pnl = round(float(results_df["pnl_abs"].sum()), 2)
     print("-" * 60)
-    print(f"Overall average P&L%: {overall_pnl:.2f}")
+    print(f"Overall P&L: {overall_abs_pnl:.2f} ({overall_pnl:.2f}%)")
 
 
 def compute_wilder_rsi(close: pd.Series, period: int = 14) -> pd.Series:
@@ -792,7 +909,7 @@ def send_telegram_message(message: str, bot_token: str | None = None, chat_id: s
         print(f"Telegram chat id looks non-numeric: {chat!r}")
 
     masked_url = f"https://api.telegram.org/bot{_mask(token)}/sendMessage"
-    print(f"Attempting Telegram send -> url={masked_url} chat_id={_mask(str(chat))} message_len={len(message)}")
+    # print(f"Attempting Telegram send -> url={masked_url} chat_id={_mask(str(chat))} message_len={len(message)}")
 
     try:
         import requests
@@ -819,53 +936,118 @@ def send_telegram_message(message: str, bot_token: str | None = None, chat_id: s
         return False
 
 
-def insert_signal_row(conn: sqlite3.Connection, row: dict[str, object]) -> int:
-    cursor = conn.execute(
-        f"""
-        INSERT INTO {quote_identifier(SIGNAL_LOG_TABLE)} (
-            source_table,
-            signal_type,
-            entry_rsi,
-            exit_rsi,
-            previous_rsi,
-            current_rsi,
-            ltp,
-            signal_date,
-            signal_timestamp,
-            product,
-            notes,
-            position_state,
-            buy_signal_id,
-            trigger_exit_rsi,
-            action_timestamp,
-            closed_by_signal_id
+def insert_signal_row(
+    conn: sqlite3.Connection,
+    row: dict[str, object],
+    table_name: str = SIGNAL_LOG_TABLE,
+    order_status: str | None = None,
+    order_reason: str | None = None,
+) -> int:
+    if table_name == ALL_SIGNAL_LOG_TABLE:
+        cursor = conn.execute(
+            f"""
+            INSERT OR IGNORE INTO {quote_identifier(table_name)} (
+                source_table,
+                signal_type,
+                entry_rsi,
+                exit_rsi,
+                previous_rsi,
+                current_rsi,
+                ltp,
+                qty,
+                product,
+                signal_date,
+                signal_timestamp,
+                notes,
+                position_state,
+                buy_signal_id,
+                trigger_exit_rsi,
+                action_timestamp,
+                closed_by_signal_id,
+                order_status,
+                order_reason
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row["source_table"],
+                row["signal_type"],
+                row["entry_rsi"],
+                row["exit_rsi"],
+                row["previous_rsi"],
+                row["current_rsi"],
+                row["ltp"],
+                row.get("qty"),
+                row.get("product"),
+                row["signal_date"],
+                row["signal_timestamp"],
+                row["notes"],
+                row["position_state"],
+                row["buy_signal_id"],
+                row["trigger_exit_rsi"],
+                row["action_timestamp"],
+                row["closed_by_signal_id"],
+                order_status,
+                order_reason,
+            ),
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            row["source_table"],
-            row["signal_type"],
-            row["entry_rsi"],
-            row["exit_rsi"],
-            row["previous_rsi"],
-            row["current_rsi"],
-            row["ltp"],
-            row["signal_date"],
-            row["signal_timestamp"],
-            row.get("product"),
-            row["notes"],
-            row["position_state"],
-            row["buy_signal_id"],
-            row["trigger_exit_rsi"],
-            row["action_timestamp"],
-            row["closed_by_signal_id"],
-        ),
-    )
+        if cursor.rowcount == 0:
+            return 0
+    else:
+        cursor = conn.execute(
+            f"""
+            INSERT INTO {quote_identifier(table_name)} (
+                source_table,
+                signal_type,
+                entry_rsi,
+                exit_rsi,
+                previous_rsi,
+                current_rsi,
+                ltp,
+                qty,
+                signal_date,
+                signal_timestamp,
+                product,
+                notes,
+                position_state,
+                buy_signal_id,
+                trigger_exit_rsi,
+                action_timestamp,
+                closed_by_signal_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row["source_table"],
+                row["signal_type"],
+                row["entry_rsi"],
+                    row["exit_rsi"],
+                    row["previous_rsi"],
+                    row["current_rsi"],
+                    row["ltp"],
+                    row.get("qty"),
+                    row["signal_date"],
+                row["signal_timestamp"],
+                row.get("product"),
+                row["notes"],
+                row["position_state"],
+                row["buy_signal_id"],
+                row["trigger_exit_rsi"],
+                row["action_timestamp"],
+                row["closed_by_signal_id"],
+            ),
+        )
     conn.commit()
     return int(cursor.lastrowid)
 
 
-def trigger_order_execution(side: str, symbol: str, ltp: float) -> dict[str, object]:
+def trigger_order_execution(
+    side: str,
+    symbol: str,
+    ltp: float,
+    confirm_order: bool = False,
+    signal_id: int | None = None,
+) -> dict[str, object]:
     script_path = Path(__file__).resolve().parent / "upstox_order_manager.py"
     if not script_path.exists():
         print(f"Skipping order execution: {script_path.name} not found.")
@@ -891,22 +1073,28 @@ def trigger_order_execution(side: str, symbol: str, ltp: float) -> dict[str, obj
         except Exception as exc:
             print(f"Unable to read Upstox funds before BUY {symbol}: {exc}")
             return {"success": False, "reason": str(exc)}
+    elif signal_id is None:
+        print(f"Skipping order execution for SELL {symbol}: signal id is required.")
+        return {"success": False, "reason": "missing signal id"}
 
     try:
+        cmd = [
+            sys.executable,
+            str(script_path),
+            "--side",
+            side,
+            "--symbol",
+            symbol,
+            "--ltp",
+            str(float(ltp)),
+            "--db-path",
+            str(DB_NAME),
+            "--live",
+        ]
+        if side.upper() == "SELL" and signal_id is not None:
+            cmd.extend(["--signal-id", str(int(signal_id))])
         completed = subprocess.run(
-            [
-                sys.executable,
-                str(script_path),
-                "--side",
-                side,
-                "--symbol",
-                symbol,
-                "--ltp",
-                str(float(ltp)),
-                "--db-path",
-                str(DB_NAME),
-                "--live",
-            ],
+            cmd,
             check=False,
             capture_output=True,
             text=True,
@@ -934,6 +1122,7 @@ def trigger_order_execution(side: str, symbol: str, ltp: float) -> dict[str, obj
         product = None
         available_funds = None
         order_value = None
+        order_id = None
         for line in stdout_text.splitlines():
             line = line.strip()
             m = re.search(r"Calculated qty:\s*(\d+)", line)
@@ -954,6 +1143,28 @@ def trigger_order_execution(side: str, symbol: str, ltp: float) -> dict[str, obj
             m = re.search(r"SELL order value:\s*([0-9]+(?:\.[0-9]+)?)", line)
             if m:
                 order_value = float(m.group(1))
+            m = re.search(r"order_id['\"]?\s*[:=]\s*['\"]?([A-Za-z0-9_-]+)", line)
+            if m:
+                order_id = m.group(1)
+            if order_id is None:
+                m = re.search(r"order_ids['\"]?\s*[:=]\s*\[\s*['\"]?([A-Za-z0-9_-]+)", line)
+                if m:
+                    order_id = m.group(1)
+
+        if order_id is None:
+            m = re.search(r"'order_ids'\s*:\s*\[\s*'([^']+)'\s*\]", stdout_text)
+            if m:
+                order_id = m.group(1)
+            else:
+                m = re.search(r'"order_ids"\s*:\s*\[\s*"([^"]+)"\s*\]', stdout_text)
+                if m:
+                    order_id = m.group(1)
+        if order_id is None:
+            for candidate in re.findall(r"order_ids['\"]?\s*[:=]\s*\[[^\]]+\]", stdout_text):
+                m = re.search(r"([A-Za-z0-9_-]{8,})", candidate)
+                if m:
+                    order_id = m.group(1)
+                    break
 
         return {
             "success": True,
@@ -964,6 +1175,7 @@ def trigger_order_execution(side: str, symbol: str, ltp: float) -> dict[str, obj
             "product": product,
             "available_funds": available_funds,
             "order_value": order_value,
+            "order_id": order_id,
         }
     except Exception as exc:
         print(f"Failed to launch upstox_order_manager.py for {side} {symbol}: {exc}")
@@ -997,10 +1209,95 @@ def _failure_reason_from_order_result(order_result: dict[str, object]) -> str:
         if marker in combined:
             return marker
 
+    for line in combined.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"^(BUY|SELL)\s+.+?\s+skipped:\s*(.+?)\.?$", line)
+        if m:
+            return f"{m.group(1)} skipped: {m.group(2)}"
+
     lines = [line.strip() for line in combined.splitlines() if line.strip()]
     if lines:
         return lines[-1]
     return "order was not placed on Upstox"
+
+
+def _prompt_order_confirmation(message: str) -> bool:
+    try:
+        while True:
+            print(message, end="", flush=True)
+            response = input().strip().upper()
+            if response in {"Y", "N"}:
+                return response == "Y"
+            print("Please type Y or N.")
+    except EOFError:
+        print("Skipping order execution: confirmation input unavailable.")
+        return False
+
+
+def _print_live_signal_context(source_table: str, current_rsi: float, latest_close: float | None, ltp: float) -> None:
+    if latest_close is None:
+        print(f"Live RSI {source_table}: {current_rsi:.2f} | LTP: {ltp:.2f}")
+    else:
+        print(
+            f"Live RSI {source_table}: {current_rsi:.2f} | "
+            f"Latest stored close: {latest_close:.2f} | LTP: {ltp:.2f}"
+        )
+
+
+def _insert_all_signal_buy_skip(
+    conn: sqlite3.Connection,
+    source_table: str,
+    entry_rsi: int,
+    exit_rsi: int,
+    current_rsi: float,
+    ltp: float,
+    signal_date: str,
+    signal_timestamp: str,
+    note_text: str,
+    buy_reason: str,
+    order_reason: str,
+) -> int:
+    return insert_signal_row(
+        conn,
+        {
+            "source_table": source_table,
+            "signal_type": "BUY",
+            "entry_rsi": entry_rsi,
+            "exit_rsi": exit_rsi,
+            "previous_rsi": current_rsi,
+            "current_rsi": current_rsi,
+            "ltp": ltp,
+            "qty": None,
+            "product": None,
+            "signal_date": signal_date,
+            "signal_timestamp": signal_timestamp,
+            "notes": f"{note_text} | {buy_reason}",
+            "position_state": BUY_OPEN_STATE,
+            "buy_signal_id": None,
+            "trigger_exit_rsi": None,
+            "action_timestamp": None,
+            "closed_by_signal_id": None,
+        },
+        table_name=ALL_SIGNAL_LOG_TABLE,
+        order_status="SKIPPED",
+        order_reason=order_reason,
+    )
+
+
+def _send_telegram_if_new_all_signal(
+    inserted_row_id: int,
+    message: str,
+    send_to_telegram: bool,
+    telegram_bot_token: str | None,
+    telegram_chat_id: str | None,
+) -> None:
+    if inserted_row_id <= 0 or not send_to_telegram:
+        return
+    ok = send_telegram_message(message, bot_token=telegram_bot_token, chat_id=telegram_chat_id)
+    if not ok:
+        print("Telegram alert not delivered for signal.")
 
 
 def handle_source_table(
@@ -1020,6 +1317,7 @@ def handle_source_table(
     telegram_chat_id: str | None = None,
     min_profit_pct: float = 0.0,
     buy_rsi_protection: float = 0.0,
+    confirm_order: bool = False,
  ) -> None:
     table_rules = heatmap_df[heatmap_df["source_table"] == source_table]
     if table_rules.empty:
@@ -1073,29 +1371,164 @@ def handle_source_table(
         qty = int(buy_qty)
         pnl = round((float(ltp) - float(buy_ltp)) * float(qty), 2)
         pnl_pct = round(((float(ltp) - float(buy_ltp)) / float(buy_ltp)) * 100.0, 4) if float(buy_ltp) else 0.0
+        _print_live_signal_context(source_table, current_rsi, latest_close, ltp)
         message = (
             f"SELL {source_table} | closed_buy_id={buy_id} | bucket=({buy_entry_rsi},{buy_exit_rsi}) | "
-            f"BUY LTP {buy_ltp:.2f} | SELL LTP {ltp:.2f} | Qty {qty} | PnL {pnl:.2f} ({pnl_pct:.4f}%) | "
+            f"BUY PRICE {buy_ltp:.2f} | SELL LTP {ltp:.2f} | Qty {qty} | PnL {pnl:.2f} ({pnl_pct:.4f}%) | "
             f"RSI {current_rsi:.2f}"
         )
         print(message)
+        if confirm_order:
+            prompt = (
+                f"Confirm SELL {source_table} | qty={qty} | BUY LTP={buy_ltp:.2f} | "
+                f"SELL LTP={ltp:.2f} | PnL={pnl:.2f} ? [Y/N]: "
+            )
+            if not _prompt_order_confirmation(prompt):
+                fail_reason = "user declined order confirmation"
+                print(f"SELL {source_table} skipped: {fail_reason}.")
+                inserted_id = insert_signal_row(
+                    conn,
+                    {
+                        "source_table": source_table,
+                        "signal_type": "SELL",
+                        "entry_rsi": buy_entry_rsi,
+                        "exit_rsi": buy_exit_rsi,
+                        "previous_rsi": current_rsi,
+                        "current_rsi": current_rsi,
+                        "ltp": ltp,
+                        "qty": qty,
+                        "product": buy_product,
+                        "signal_date": signal_date,
+                        "signal_timestamp": signal_timestamp,
+                        "notes": f"SKIPPED | {fail_reason} | BUY_PRICE={buy_ltp:.2f} | PnL={pnl:.2f}",
+                        "position_state": SELL_CONFIRMED_STATE,
+                        "buy_signal_id": buy_id,
+                        "trigger_exit_rsi": buy_exit_rsi,
+                        "action_timestamp": signal_timestamp,
+                        "closed_by_signal_id": None,
+                    },
+                    table_name=ALL_SIGNAL_LOG_TABLE,
+                    order_status="SKIPPED",
+                    order_reason=fail_reason,
+                )
+                _send_telegram_if_new_all_signal(
+                    inserted_id,
+                    (
+                        f"SELL {source_table} skipped | bucket=({buy_entry_rsi},{buy_exit_rsi}) | "
+                        f"RSI {current_rsi:.2f} | LTP {ltp:.2f}"
+                    ),
+                    send_to_telegram,
+                    telegram_bot_token,
+                    telegram_chat_id,
+                )
+                return
         if dry_run:
-            if send_to_telegram:
-                ok = send_telegram_message(message, bot_token=telegram_bot_token, chat_id=telegram_chat_id)
-                if not ok:
-                    print("Telegram alert not delivered for SELL signal.")
+            inserted_id = insert_signal_row(
+                conn,
+                {
+                    "source_table": source_table,
+                    "signal_type": "SELL",
+                    "entry_rsi": buy_entry_rsi,
+                    "exit_rsi": buy_exit_rsi,
+                    "previous_rsi": current_rsi,
+                    "current_rsi": current_rsi,
+                    "ltp": ltp,
+                    "qty": qty,
+                    "product": buy_product,
+                    "signal_date": signal_date,
+                    "signal_timestamp": signal_timestamp,
+                    "notes": f"DRY_RUN | {sell_reason} | BUY_PRICE={buy_ltp:.2f} | PnL={pnl:.2f}",
+                    "position_state": SELL_CONFIRMED_STATE,
+                    "buy_signal_id": buy_id,
+                    "trigger_exit_rsi": buy_exit_rsi,
+                    "action_timestamp": signal_timestamp,
+                    "closed_by_signal_id": None,
+                },
+                table_name=ALL_SIGNAL_LOG_TABLE,
+                order_status="DRY_RUN",
+                order_reason="dry run",
+            )
+            _send_telegram_if_new_all_signal(
+                inserted_id,
+                message,
+                send_to_telegram,
+                telegram_bot_token,
+                telegram_chat_id,
+            )
             return
 
-        order_result = trigger_order_execution("SELL", source_table, ltp)
+        order_result = trigger_order_execution(
+            "SELL",
+            source_table,
+            ltp,
+            confirm_order=False,
+            signal_id=buy_id,
+        )
         if not order_result.get("success"):
             fail_reason = _failure_reason_from_order_result(order_result)
             fail_message = f"SELL {source_table} skipped: {fail_reason}."
             print(fail_message)
-            if send_to_telegram:
-                ok = send_telegram_message(fail_message, bot_token=telegram_bot_token, chat_id=telegram_chat_id)
-                if not ok:
-                    print("Telegram alert not delivered for SELL signal.")
+            inserted_id = insert_signal_row(
+                conn,
+                {
+                    "source_table": source_table,
+                    "signal_type": "SELL",
+                    "entry_rsi": buy_entry_rsi,
+                    "exit_rsi": buy_exit_rsi,
+                    "previous_rsi": current_rsi,
+                    "current_rsi": current_rsi,
+                    "ltp": ltp,
+                    "qty": qty,
+                    "product": buy_product,
+                    "signal_date": signal_date,
+                    "signal_timestamp": signal_timestamp,
+                    "notes": f"SKIPPED | {fail_reason} | BUY_PRICE={buy_ltp:.2f} | PnL={pnl:.2f}",
+                    "position_state": SELL_CONFIRMED_STATE,
+                    "buy_signal_id": buy_id,
+                    "trigger_exit_rsi": buy_exit_rsi,
+                    "action_timestamp": signal_timestamp,
+                    "closed_by_signal_id": None,
+                },
+                table_name=ALL_SIGNAL_LOG_TABLE,
+                order_status="SKIPPED",
+                order_reason=fail_reason,
+            )
+            _send_telegram_if_new_all_signal(
+                inserted_id,
+                (
+                    f"SELL {source_table} skipped | bucket=({buy_entry_rsi},{buy_exit_rsi}) | "
+                    f"RSI {current_rsi:.2f} | LTP {ltp:.2f}"
+                ),
+                send_to_telegram,
+                telegram_bot_token,
+                telegram_chat_id,
+            )
             return
+        if not str(order_result.get("order_id") or "").strip():
+            print(
+                f"SELL {source_table} skipped: Upstox did not return an order id."
+            )
+            return
+
+        try:
+            from upstox_order_manager import update_signal_execution_details
+
+            resolved_qty = int(order_result.get("qty") or qty)
+            resolved_product = str(order_result.get("product") or buy_product or "").strip() or None
+            if update_signal_execution_details(
+                buy_id,
+                resolved_qty,
+                resolved_product,
+                db_path=DB_PATH,
+            ):
+                print(
+                    f"Updated {SIGNAL_LOG_TABLE} for signal_id={buy_id} "
+                    f"with qty={resolved_qty}."
+                )
+        except Exception as exc:
+            print(
+                f"Warning: failed to update execution details for signal_id={buy_id}: {exc}"
+            )
 
         sell_id = insert_signal_row(
             conn,
@@ -1111,7 +1544,7 @@ def handle_source_table(
                 "product": buy_product,
                 "signal_date": signal_date,
                 "signal_timestamp": signal_timestamp,
-                "notes": f"{sell_reason} | BUY_LTP={buy_ltp:.2f} | PnL={pnl:.2f}",
+                "notes": f"{sell_reason} | BUY_PRICE={buy_ltp:.2f} | PnL={pnl:.2f}",
                 "position_state": SELL_CONFIRMED_STATE,
                 "buy_signal_id": buy_id,
                 "trigger_exit_rsi": buy_exit_rsi,
@@ -1119,11 +1552,39 @@ def handle_source_table(
                 "closed_by_signal_id": None,
             },
         )
+        inserted_id = insert_signal_row(
+            conn,
+            {
+                "source_table": source_table,
+                "signal_type": "SELL",
+                "entry_rsi": buy_entry_rsi,
+                "exit_rsi": buy_exit_rsi,
+                "previous_rsi": current_rsi,
+                "current_rsi": current_rsi,
+                "ltp": ltp,
+                "qty": qty,
+                "product": buy_product,
+                "signal_date": signal_date,
+                "signal_timestamp": signal_timestamp,
+                "notes": f"{sell_reason} | BUY_PRICE={buy_ltp:.2f} | PnL={pnl:.2f}",
+                "position_state": SELL_CONFIRMED_STATE,
+                "buy_signal_id": buy_id,
+                "trigger_exit_rsi": buy_exit_rsi,
+                "action_timestamp": signal_timestamp,
+                "closed_by_signal_id": None,
+            },
+            table_name=ALL_SIGNAL_LOG_TABLE,
+            order_status="PLACED",
+            order_reason=None,
+        )
+        _send_telegram_if_new_all_signal(
+            inserted_id,
+            message,
+            send_to_telegram,
+            telegram_bot_token,
+            telegram_chat_id,
+        )
         close_buy_bucket(conn, buy_id, sell_id, signal_timestamp)
-        if send_to_telegram:
-            ok = send_telegram_message(message, bot_token=telegram_bot_token, chat_id=telegram_chat_id)
-            if not ok:
-                print("Telegram alert not delivered for SELL signal.")
         return
 
     # If no SELL was generated, allow new BUY signals only when no open BUY exists for that bucket
@@ -1169,28 +1630,200 @@ def handle_source_table(
         message = (
             f"BUY {source_table} | bucket=({entry_rsi},{exit_rsi}) | RSI {current_rsi:.2f} | LTP {ltp:.2f}"
         )
+        _print_live_signal_context(source_table, current_rsi, latest_close, ltp)
         print(message)
+        if confirm_order:
+            try:
+                from upstox_order_manager import (
+                    DAILY_LIMIT,
+                    add_today_reject,
+                    UpstoxOrderManager,
+                    is_today_rejected,
+                    validate_trade_amount,
+                )
+
+                if is_today_rejected(source_table):
+                    fail_reason = "symbol declined earlier today"
+                    print(f"BUY {source_table} skipped: {fail_reason}.")
+                    inserted_id = _insert_all_signal_buy_skip(
+                        conn,
+                        source_table,
+                        entry_rsi,
+                        exit_rsi,
+                        current_rsi,
+                        ltp,
+                        signal_date,
+                        signal_timestamp,
+                        "SKIPPED | symbol declined earlier today",
+                        buy_reason,
+                        fail_reason,
+                    )
+                    _send_telegram_if_new_all_signal(
+                        inserted_id,
+                        (
+                            f"BUY {source_table} skipped | bucket=({entry_rsi},{exit_rsi}) | "
+                            f"RSI {current_rsi:.2f} | LTP {ltp:.2f}"
+                        ),
+                        send_to_telegram,
+                        telegram_bot_token,
+                        telegram_chat_id,
+                    )
+                    return
+
+                available_funds = UpstoxOrderManager().get_available_margin()
+                prompt_qty, prompt_order_value, used_today = validate_trade_amount(
+                    source_table,
+                    ltp,
+                    available_margin=available_funds,
+                )
+                prompt = (
+                    f"Confirm BUY {source_table} | qty={prompt_qty} | order_value={prompt_order_value:.2f} | "
+                    f"available_funds={available_funds:.2f} | "
+                    f"remaining_daily_limit={max(0.0, DAILY_LIMIT - used_today):.2f} ? [Y/N]: "
+                )
+                if not _prompt_order_confirmation(prompt):
+                    fail_reason = "user declined order confirmation"
+                    print(f"BUY {source_table} skipped: {fail_reason}.")
+                    inserted_id = _insert_all_signal_buy_skip(
+                        conn,
+                        source_table,
+                        entry_rsi,
+                        exit_rsi,
+                        current_rsi,
+                        ltp,
+                        signal_date,
+                        signal_timestamp,
+                        "SKIPPED | user declined order confirmation",
+                        buy_reason,
+                        fail_reason,
+                    )
+                    try:
+                        add_today_reject(source_table)
+                    except Exception as reject_exc:
+                        print(f"Warning: unable to add {source_table} to reject list: {reject_exc}")
+                    _send_telegram_if_new_all_signal(
+                        inserted_id,
+                        (
+                            f"BUY {source_table} skipped | bucket=({entry_rsi},{exit_rsi}) | "
+                            f"RSI {current_rsi:.2f} | LTP {ltp:.2f}"
+                        ),
+                        send_to_telegram,
+                        telegram_bot_token,
+                        telegram_chat_id,
+                    )
+                    return
+            except Exception as exc:
+                reason_text = str(exc)
+                print(f"Unable to prepare BUY confirmation for {source_table}: {exc}")
+                inserted_id = _insert_all_signal_buy_skip(
+                    conn,
+                    source_table,
+                    entry_rsi,
+                    exit_rsi,
+                    current_rsi,
+                    ltp,
+                    signal_date,
+                    signal_timestamp,
+                    f"SKIPPED | {reason_text}",
+                    buy_reason,
+                    reason_text,
+                )
+                _send_telegram_if_new_all_signal(
+                    inserted_id,
+                    (
+                        f"BUY {source_table} skipped | bucket=({entry_rsi},{exit_rsi}) | "
+                        f"RSI {current_rsi:.2f} | LTP {ltp:.2f}"
+                    ),
+                    send_to_telegram,
+                    telegram_bot_token,
+                    telegram_chat_id,
+                )
+                return
+
         if dry_run:
-            if send_to_telegram:
-                ok = send_telegram_message(message, bot_token=telegram_bot_token, chat_id=telegram_chat_id)
-                if not ok:
-                    print("Telegram alert not delivered for BUY signal.")
+            inserted_id = insert_signal_row(
+                conn,
+                {
+                    "source_table": source_table,
+                    "signal_type": "BUY",
+                    "entry_rsi": entry_rsi,
+                    "exit_rsi": exit_rsi,
+                    "previous_rsi": current_rsi,
+                    "current_rsi": current_rsi,
+                    "ltp": ltp,
+                    "qty": None,
+                    "product": None,
+                    "signal_date": signal_date,
+                    "signal_timestamp": signal_timestamp,
+                    "notes": f"DRY_RUN | {buy_reason}",
+                    "position_state": BUY_OPEN_STATE,
+                    "buy_signal_id": None,
+                    "trigger_exit_rsi": None,
+                    "action_timestamp": None,
+                    "closed_by_signal_id": None,
+                },
+                table_name=ALL_SIGNAL_LOG_TABLE,
+                order_status="DRY_RUN",
+                order_reason="dry run",
+            )
+            _send_telegram_if_new_all_signal(
+                inserted_id,
+                message,
+                send_to_telegram,
+                telegram_bot_token,
+                telegram_chat_id,
+            )
             return
 
-        order_result = trigger_order_execution("BUY", source_table, ltp)
+        order_result = trigger_order_execution("BUY", source_table, ltp, confirm_order=False)
         if not order_result.get("success"):
             fail_reason = _failure_reason_from_order_result(order_result)
             fail_message = f"BUY {source_table} skipped: {fail_reason}."
             print(fail_message)
-            if send_to_telegram:
-                ok = send_telegram_message(fail_message, bot_token=telegram_bot_token, chat_id=telegram_chat_id)
-                if not ok:
-                    print("Telegram alert not delivered for BUY signal.")
+            inserted_id = insert_signal_row(
+                conn,
+                {
+                    "source_table": source_table,
+                    "signal_type": "BUY",
+                    "entry_rsi": entry_rsi,
+                    "exit_rsi": exit_rsi,
+                    "previous_rsi": current_rsi,
+                    "current_rsi": current_rsi,
+                    "ltp": ltp,
+                    "qty": None,
+                    "product": None,
+                    "signal_date": signal_date,
+                    "signal_timestamp": signal_timestamp,
+                    "notes": f"SKIPPED | {fail_reason} | {buy_reason}",
+                    "position_state": BUY_OPEN_STATE,
+                    "buy_signal_id": None,
+                    "trigger_exit_rsi": None,
+                    "action_timestamp": None,
+                    "closed_by_signal_id": None,
+                },
+                table_name=ALL_SIGNAL_LOG_TABLE,
+                order_status="SKIPPED",
+                order_reason=fail_reason,
+            )
+            _send_telegram_if_new_all_signal(
+                inserted_id,
+                (
+                    f"BUY {source_table} skipped | bucket=({entry_rsi},{exit_rsi}) | "
+                    f"RSI {current_rsi:.2f} | LTP {ltp:.2f}"
+                ),
+                send_to_telegram,
+                telegram_bot_token,
+                telegram_chat_id,
+            )
             return
 
         buy_qty = order_result.get("qty")
         if buy_qty is None:
-            buy_qty = max(1, int(PER_TRADE_VALUE // float(ltp)))
+            try:
+                from upstox_order_manager import PER_TRADE_VALUE as UPS_PCT_PER_TRADE_VALUE
+            except Exception:
+                UPS_PCT_PER_TRADE_VALUE = 0.0
+            buy_qty = max(1, int(float(UPS_PCT_PER_TRADE_VALUE) // float(ltp))) if float(UPS_PCT_PER_TRADE_VALUE) > 0 else 1
         buy_product = order_result.get("product") or "D"
         buy_id = insert_signal_row(
             conn,
@@ -1214,10 +1847,38 @@ def handle_source_table(
                 "closed_by_signal_id": None,
             },
         )
-        if send_to_telegram:
-            ok = send_telegram_message(message, bot_token=telegram_bot_token, chat_id=telegram_chat_id)
-            if not ok:
-                print("Telegram alert not delivered for BUY signal.")
+        inserted_id = insert_signal_row(
+            conn,
+            {
+                "source_table": source_table,
+                "signal_type": "BUY",
+                "entry_rsi": entry_rsi,
+                "exit_rsi": exit_rsi,
+                "previous_rsi": current_rsi,
+                "current_rsi": current_rsi,
+                "ltp": ltp,
+                "qty": int(buy_qty),
+                "product": str(buy_product),
+                "signal_date": signal_date,
+                "signal_timestamp": signal_timestamp,
+                "notes": buy_reason,
+                "position_state": BUY_OPEN_STATE,
+                "buy_signal_id": None,
+                "trigger_exit_rsi": None,
+                "action_timestamp": None,
+                "closed_by_signal_id": None,
+            },
+            table_name=ALL_SIGNAL_LOG_TABLE,
+            order_status="PLACED",
+            order_reason=None,
+        )
+        _send_telegram_if_new_all_signal(
+            inserted_id,
+            message,
+            send_to_telegram,
+            telegram_bot_token,
+            telegram_chat_id,
+        )
         return
 
 
@@ -1253,6 +1914,7 @@ def main() -> None:
     print("\nStartup configuration summary")
     print("-" * 48)
     print(f"Interval: {getattr(args, 'interval', DEFAULT_INTERVAL_SECONDS)}s   Symbols: {symbols_display}")
+    print(f"Confirm order: {getattr(args, 'confirmOrder', False)}")
     print(f"Telegram: {'ENABLED' if getattr(args, 'telegram', False) else 'DISABLED'}  token_sample={bot_sample} chat_sample={chat_sample}")
     print(f"Active protections: {', '.join(protections) if protections else 'None'}")
     print("-" * 48 + "\n")
@@ -1278,8 +1940,10 @@ def main() -> None:
             print(f"Unable to read Upstox available funds at startup: {exc}")
             print("-" * 48 + "\n")
 
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_NAME, timeout=30)
     try:
+        conn.execute("PRAGMA busy_timeout = 30000")
+        conn.execute("PRAGMA journal_mode = WAL")
         ensure_signal_log_table(conn)
         if args.results:
             if not table_exists(conn, SIGNAL_LOG_TABLE):
@@ -1331,14 +1995,30 @@ def main() -> None:
                 )
                 print(f"Live price snapshot: {snapshot}")
 
+            if not is_market_open_now():
+                now = datetime.now()
+                print(
+                    f"Outside market window ({MARKET_OPEN_HOUR:02d}:{MARKET_OPEN_MINUTE:02d} "
+                    f"to {MARKET_CLOSE_HOUR:02d}:{MARKET_CLOSE_MINUTE:02d}). "
+                    f"Skipping signal generation at {now.strftime('%H:%M:%S')}."
+                )
+                time.sleep(interval_seconds)
+                continue
+
             now = datetime.now()
             signal_date = now.strftime("%Y-%m-%d")
             signal_timestamp = now.isoformat(timespec="seconds")
 
             for source_table, ltp in ltps.items():
-                current_rsi, latest_close, _ = load_latest_rsi(conn, source_table)
+                history_df = load_close_history(conn, source_table)
+                if history_df.empty:
+                    print(f"Skipping {source_table}: no close history available.")
+                    continue
+
+                latest_close = round(float(history_df.iloc[-1]["close"]), 2)
+                current_rsi = compute_live_rsi(history_df, ltp)
                 if current_rsi is None:
-                    print(f"Skipping {source_table}: no latest RSI available.")
+                    print(f"Skipping {source_table}: unable to compute live RSI from history and LTP.")
                     continue
 
                 previous_rsi = None
@@ -1362,8 +2042,10 @@ def main() -> None:
                     telegram_chat_id=getattr(args, "telegram_chat_id", None),
                     min_profit_pct=getattr(args, "min_profit_pct", 0.0),
                     buy_rsi_protection=getattr(args, "buy_rsi_protection", 0.0),
+                    confirm_order=getattr(args, "confirmOrder", False),
                 )
 
+            print("-----------------------------------------------------------------------------------------------")
             time.sleep(interval_seconds)
     finally:
         if live_feed is not None:
