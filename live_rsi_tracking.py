@@ -57,6 +57,7 @@ MARKET_OPEN_HOUR = 9
 MARKET_OPEN_MINUTE = 20
 MARKET_CLOSE_HOUR = 15
 MARKET_CLOSE_MINUTE = 30
+SELL_AMC_CHARGE = 26.0
 
 BUY_OPEN_STATE = "OPEN"
 BUY_CLOSED_STATE = "CLOSED"
@@ -1062,13 +1063,13 @@ def trigger_order_execution(
 
     if side.upper() == "BUY":
         try:
-            from upstox_order_manager import PER_TRADE_VALUE, UpstoxOrderManager
+            from upstox_order_manager import UpstoxOrderManager
 
             funds_manager = UpstoxOrderManager()
             available_funds = funds_manager.get_available_margin()
             print(f"Available Upstox funds: {available_funds:.2f}")
-            if available_funds < PER_TRADE_VALUE:
-                print("Funds are lower than Per trade value")
+            if available_funds <= 0:
+                print("No available funds in Upstox")
                 return {"success": False, "reason": "funds lower than per trade value"}
         except Exception as exc:
             print(f"Unable to read Upstox funds before BUY {symbol}: {exc}")
@@ -1371,6 +1372,12 @@ def handle_source_table(
         qty = int(buy_qty)
         pnl = round((float(ltp) - float(buy_ltp)) * float(qty), 2)
         pnl_pct = round(((float(ltp) - float(buy_ltp)) / float(buy_ltp)) * 100.0, 4) if float(buy_ltp) else 0.0
+        if pnl <= SELL_AMC_CHARGE:
+            print(
+                f"Skipping SELL {source_table} for buy_id={buy_id}: "
+                f"PnL={pnl:.2f} <= AMC charge {SELL_AMC_CHARGE:.2f}"
+            )
+            continue
         _print_live_signal_context(source_table, current_rsi, latest_close, ltp)
         message = (
             f"SELL {source_table} | closed_buy_id={buy_id} | bucket=({buy_entry_rsi},{buy_exit_rsi}) | "
@@ -1916,6 +1923,7 @@ def main() -> None:
     print(f"Interval: {getattr(args, 'interval', DEFAULT_INTERVAL_SECONDS)}s   Symbols: {symbols_display}")
     print(f"Confirm order: {getattr(args, 'confirmOrder', False)}")
     print(f"Telegram: {'ENABLED' if getattr(args, 'telegram', False) else 'DISABLED'}  token_sample={bot_sample} chat_sample={chat_sample}")
+    print("BUY sizing: uses available funds and DAILY_LIMIT; no hard PER_TRADE_VALUE precheck.")
     print(f"Active protections: {', '.join(protections) if protections else 'None'}")
     print("-" * 48 + "\n")
     interval_seconds = max(5, args.interval)
