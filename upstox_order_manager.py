@@ -18,6 +18,7 @@ This module:
 IMPORTANT:
 The place_buy/place_sell methods submit REAL orders when using your live
 Upstox access token. Test with Upstox Sandbox before going live.
+
 """
 
 from __future__ import annotations
@@ -1104,8 +1105,8 @@ def main() -> None:
         if is_today_rejected(args.symbol):
             print(f"BUY {args.symbol} skipped: symbol declined earlier today.")
             return
-        if available_margin < PER_TRADE_VALUE:
-            print("Funds are lower than Per trade value")
+        if available_margin <= 0:
+            print("No available funds in Upstox")
             return
         try:
             qty, order_value, used_today = validate_trade_amount(

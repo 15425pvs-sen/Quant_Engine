@@ -12,7 +12,7 @@ Usage:
     py live_rsi_tracking.py --hybrid --results
     py live_rsi_tracking.py --hybrid --telegram --confirmOrder
     py live_rsi_tracking.py --hybrid --buy-rsi-protection 1.0 --telegram --confirmOrder
-    >py live_rsi_tracking.py --hybrid --telegram --confirmOrder --buy-rsi-protection 1.0
+    py live_rsi_tracking.py --hybrid --telegram --confirmOrder --buy-rsi-protection 1.0
 
 $env:UPSTOX_ALLOW_LIVE_ORDERS="true"
 py live_rsi_tracking.py --hybrid --telegram
@@ -1166,6 +1166,20 @@ def trigger_order_execution(
                 if m:
                     order_id = m.group(1)
                     break
+
+        if order_id is None:
+            return {
+                "success": False,
+                "reason": "Upstox order was not placed",
+                "exit_code": completed.returncode,
+                "stdout": stdout_text,
+                "stderr": stderr_text,
+                "qty": qty,
+                "product": product,
+                "available_funds": available_funds,
+                "order_value": order_value,
+                "order_id": None,
+            }
 
         return {
             "success": True,
