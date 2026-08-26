@@ -70,6 +70,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Rebuild heatmap data even if it already exists.",
     )
+    parser.add_argument(
+        "--rerun-today",
+        action="store_true",
+        help="Allow quant_engine.py to run again today even if a successful run already exists.",
+    )
     return parser.parse_args()
 
 
@@ -121,6 +126,36 @@ def create_run(conn: sqlite3.Connection, symbols: list[str], force_heatmap: bool
     )
     conn.commit()
     return int(cursor.lastrowid)
+
+
+def has_successful_run_today(conn: sqlite3.Connection) -> bool:
+    today = utc_now()[:10]
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM quant_engine_runs
+        WHERE substr(started_at, 1, 10) = ?
+          AND status = 'success'
+        LIMIT 1
+        """,
+        (today,),
+    ).fetchone()
+    return row is not None
+
+
+def has_running_run_today(conn: sqlite3.Connection) -> bool:
+    today = utc_now()[:10]
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM quant_engine_runs
+        WHERE substr(started_at, 1, 10) = ?
+          AND status = 'running'
+        LIMIT 1
+        """,
+        (today,),
+    ).fetchone()
+    return row is not None
 
 
 def finish_run(conn: sqlite3.Connection, run_id: int, status: str, error_message: str | None = None) -> None:
@@ -348,6 +383,20 @@ def main() -> None:
     run_conn = sqlite3.connect(DB_PATH)
     try:
         ensure_engine_tables(run_conn)
+
+        if has_running_run_today(run_conn):
+            today = utc_now()[:10]
+            print(f"quant_engine.py is already running today ({today}); skipping this invocation.")
+            return
+
+        if has_successful_run_today(run_conn) and not args.rerun_today:
+            today = utc_now()[:10]
+            print(
+                f"quant_engine.py already completed successfully today ({today}); "
+                f"skipping. Use --rerun-today to run again."
+            )
+            return
+
         describe_selected_tables(run_conn, symbol_args)
         run_id = create_run(run_conn, symbol_args, args.force_heatmap)
 

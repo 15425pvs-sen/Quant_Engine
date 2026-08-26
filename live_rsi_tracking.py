@@ -161,6 +161,13 @@ def parse_args() -> argparse.Namespace:
         dest="upstox_live",
         help="Disable the Upstox websocket feed and fall back to yfinance polling.",
     )
+    parser.add_argument(
+        "--no-sync-daily-data",
+        action="store_false",
+        dest="sync_daily_data",
+        default=True,
+        help="Disable the automatic after-hours quant_engine sync step.",
+    )
     return parser.parse_args()
 
 
@@ -170,6 +177,33 @@ def is_market_open_now(now: datetime | None = None) -> bool:
     open_minutes = MARKET_OPEN_HOUR * 60 + MARKET_OPEN_MINUTE
     close_minutes = MARKET_CLOSE_HOUR * 60 + MARKET_CLOSE_MINUTE
     return open_minutes <= current_minutes <= close_minutes
+
+
+def run_daily_quant_sync(requested_symbols: list[str]) -> None:
+    quant_engine_path = Path(__file__).resolve().parent / "quant_engine.py"
+    if not quant_engine_path.exists():
+        print("Daily sync skipped: quant_engine.py not found.")
+        return
+
+    cmd = [sys.executable, str(quant_engine_path)]
+    if requested_symbols:
+        cmd.extend(requested_symbols)
+
+    print("\nRunning daily data sync via quant_engine.py ...")
+    completed = subprocess.run(
+        cmd,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.stdout:
+        print(completed.stdout, end="" if completed.stdout.endswith("\n") else "\n")
+    if completed.stderr:
+        print(completed.stderr, end="" if completed.stderr.endswith("\n") else "\n")
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"quant_engine.py failed with exit code {completed.returncode}."
+        )
 
 
 def ensure_signal_log_table(conn: sqlite3.Connection) -> None:
@@ -272,13 +306,17 @@ def ensure_signal_log_table(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute(
+        f"DROP INDEX IF EXISTS idx_{ALL_SIGNAL_LOG_TABLE}_unique_bucket"
+    )
+    conn.execute(
         f"""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_{ALL_SIGNAL_LOG_TABLE}_unique_bucket
         ON {quote_identifier(ALL_SIGNAL_LOG_TABLE)} (
             trim(upper(source_table)),
             signal_type,
             entry_rsi,
-            exit_rsi
+            exit_rsi,
+            signal_date
         )
         """
     )
@@ -1369,6 +1407,10 @@ def handle_source_table(
             continue
 
         if ltp <= buy_ltp:
+            print(
+                f"Skipping SELL {source_table} for buy_id={buy_id}: "
+                f"LTP={ltp:.2f} <= BUY_LTP={buy_ltp:.2f} even though RSI={current_rsi:.2f} >= exit_rsi={buy_exit_rsi}"
+            )
             continue
 
         # Require minimum profit percentage before creating a SELL to avoid tiny P&L trades
@@ -1961,6 +2003,12 @@ def main() -> None:
         except Exception as exc:
             print(f"Unable to read Upstox available funds at startup: {exc}")
             print("-" * 48 + "\n")
+
+    if getattr(args, "sync_daily_data", True):
+        try:
+            run_daily_quant_sync(requested_symbols)
+        except Exception as exc:
+            raise RuntimeError(f"Daily data sync failed: {exc}") from exc
 
     conn = sqlite3.connect(DB_NAME, timeout=30)
     try:
