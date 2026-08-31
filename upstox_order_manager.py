@@ -365,7 +365,7 @@ def fetch_signal_row(
             row = conn.execute(
                 f"""
                 SELECT id, source_table, signal_type, qty, product, buy_signal_id, position_state,
-                       signal_date, signal_timestamp, action_timestamp, closed_by_signal_id
+                       signal_date, signal_timestamp, action_timestamp, closed_by_signal_id, basket_buy_ids
                 FROM {SIGNAL_LOG_TABLE}
                 WHERE id = ?
                 """,
@@ -375,6 +375,18 @@ def fetch_signal_row(
     except sqlite3.Error as exc:
         print(f"Warning: failed to fetch signal row {signal_id}: {exc}")
         return None
+
+
+def fetch_signal_rows(
+    signal_ids: list[int],
+    db_path: Path = DB_PATH,
+) -> list[Dict[str, Any]]:
+    rows: list[Dict[str, Any]] = []
+    for signal_id in signal_ids:
+        row = fetch_signal_row(int(signal_id), db_path=db_path)
+        if row is not None:
+            rows.append(row)
+    return rows
 
 
 def resolve_sell_quantity(
@@ -439,6 +451,52 @@ def resolve_sell_quantity(
 
     buy_product = _normalize_text(buy_row.get("product")) or None
     return qty, buy_signal_id, buy_product
+
+
+def resolve_basket_sell_quantity(
+    basket_buy_ids: list[int],
+    db_path: Path = DB_PATH,
+) -> tuple[int, list[int], str | None, datetime | None]:
+    if not basket_buy_ids:
+        raise ValueError("Basket SELL requires at least one BUY signal id.")
+
+    buy_rows = fetch_signal_rows(basket_buy_ids, db_path=db_path)
+    if len(buy_rows) != len(basket_buy_ids):
+        missing = sorted(set(int(signal_id) for signal_id in basket_buy_ids) - {int(row["id"]) for row in buy_rows})
+        raise ValueError(f"Basket BUY signal rows not found for ids: {missing}")
+
+    total_qty = 0
+    products: set[str] = set()
+    trade_dates: list[datetime] = []
+    for row in buy_rows:
+        if str(row.get("signal_type", "")).upper() != "BUY":
+            raise ValueError(f"Signal row {row.get('id')} is not a BUY row.")
+
+        qty_raw = row.get("qty")
+        try:
+            qty = int(qty_raw or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        if qty <= 0:
+            raise ValueError(f"BUY signal row {row.get('id')} has no valid qty.")
+
+        total_qty += qty
+        product = _normalize_text(row.get("product")) or ""
+        if product:
+            products.add(product)
+
+        trade_dt = _parse_signal_date(row.get("signal_date"))
+        if trade_dt is not None:
+            trade_dates.append(trade_dt)
+
+    if len(products) > 1:
+        raise ValueError(
+            f"Basket BUY signal rows must all have the same product type, found: {sorted(products)}"
+        )
+
+    preferred_product = products.pop() if len(products) == 1 else None
+    earliest_trade_dt = min(trade_dates) if trade_dates else None
+    return total_qty, [int(signal_id) for signal_id in basket_buy_ids], preferred_product, earliest_trade_dt
 
 
 def _normalize_text(value: Any) -> str:
@@ -1066,6 +1124,11 @@ def main() -> None:
         help="Optional rsi_live_signal_log_trading row id to update with qty.",
     )
     parser.add_argument(
+        "--basket-buy-ids",
+        default="",
+        help="Comma-separated BUY signal ids to combine into one SELL order.",
+    )
+    parser.add_argument(
         "--db-path",
         default=str(DB_PATH),
         help="Path to quant_historic_data.db used for qty updates.",
@@ -1093,6 +1156,7 @@ def main() -> None:
     used_today = 0.0
     linked_buy_signal_id: int | None = None
     resolved_sell_product: str | None = None
+    basket_buy_ids: list[int] = []
 
     try:
         available_margin = manager.get_available_margin()
@@ -1135,100 +1199,199 @@ def main() -> None:
             print(f"BUY {args.symbol} skipped: {exc}")
             return
     else:
-        if args.signal_id is None:
-            print("SELL orders require --signal-id so the linked BUY quantity can be resolved.")
-            return
+        basket_arg = str(args.basket_buy_ids or "").strip()
+        if basket_arg:
+            try:
+                basket_buy_ids = [
+                    int(part.strip())
+                    for part in basket_arg.split(",")
+                    if part.strip()
+                ]
+            except ValueError:
+                print(f"SELL {args.symbol} skipped: invalid --basket-buy-ids value.")
+                return
 
-        try:
-            qty, linked_buy_signal_id, linked_buy_product = resolve_sell_quantity(
-                args.signal_id,
-                db_path=db_path,
-            )
-            linked_buy_row = fetch_signal_row(linked_buy_signal_id, db_path=db_path)
-            linked_buy_product = str(linked_buy_product or "").upper() or None
-            linked_buy_dt = _parse_signal_date((linked_buy_row or {}).get("signal_timestamp"))
-            if linked_buy_dt is None:
-                linked_buy_dt = _parse_signal_date((linked_buy_row or {}).get("action_timestamp"))
-            if linked_buy_dt is None:
-                linked_buy_dt = _parse_signal_date((linked_buy_row or {}).get("signal_date"))
-            today_key = datetime.now().date()
-            should_convert_same_day = (
-                linked_buy_product == "D"
-                and linked_buy_dt is not None
-                and linked_buy_dt.date() == today_key
-            )
-
-            if should_convert_same_day and manager.allow_live_orders:
-                positions = manager.get_positions()
-                live_same_day_qty = _available_positions_quantity(
-                    positions,
-                    args.symbol,
-                    args.exchange,
-                    product="D",
+            try:
+                qty, basket_buy_ids, linked_buy_product, basket_trade_dt = resolve_basket_sell_quantity(
+                    basket_buy_ids,
+                    db_path=db_path,
                 )
-                if live_same_day_qty <= 0:
-                    raise UpstoxOrderError(
-                        f"Insufficient live same-day positions for {args.symbol} on {args.exchange}. "
-                        f"Required {qty}, positions available {live_same_day_qty}."
-                    )
-                if live_same_day_qty < qty:
-                    print(
-                        f"Same-day SELL quantity {qty} exceeds live same-day positions "
-                        f"{live_same_day_qty}; using available quantity."
-                    )
-                    qty = live_same_day_qty
+                linked_buy_signal_id = basket_buy_ids[0]
+                linked_buy_row = fetch_signal_row(linked_buy_signal_id, db_path=db_path)
+                basket_buy_rows = fetch_signal_rows(basket_buy_ids, db_path=db_path)
+                today_key = datetime.now().date()
+                should_convert_same_day = (
+                    linked_buy_product == "D"
+                    and basket_trade_dt is not None
+                    and basket_trade_dt.date() == today_key
+                )
 
-                try:
-                    conversion_result = manager.convert_position(
+                if should_convert_same_day and manager.allow_live_orders:
+                    positions = manager.get_positions()
+                    live_same_day_qty = _available_positions_quantity(
+                        positions,
+                        args.symbol,
+                        args.exchange,
+                        product="D",
+                    )
+                    if live_same_day_qty <= 0:
+                        raise UpstoxOrderError(
+                            f"Insufficient live same-day positions for {args.symbol} on {args.exchange}. "
+                            f"Required {qty}, positions available {live_same_day_qty}."
+                        )
+                    if live_same_day_qty < qty:
+                        print(
+                            f"Same-day SELL quantity {qty} exceeds live same-day positions "
+                            f"{live_same_day_qty}; using available quantity."
+                        )
+                        qty = live_same_day_qty
+
+                    try:
+                        conversion_result = manager.convert_position(
+                            args.symbol,
+                            args.exchange,
+                            qty,
+                            old_product="D",
+                            new_product="I",
+                            transaction_type="BUY",
+                        )
+                        print(
+                            f"Converted same-day delivery position to intraday for {args.symbol} "
+                            f"before SELL."
+                        )
+                        if conversion_result.get("status") != "DRY_RUN":
+                            print(f"Conversion response: {conversion_result}")
+                    except UpstoxOrderError as exc:
+                        print(
+                            f"SELL {args.symbol} skipped: unable to convert same-day "
+                            f"delivery position to intraday: {exc}"
+                        )
+                        return
+
+                    resolved_sell_product = "I"
+                    live_available_qty = qty
+                    inventory_source = "converted"
+                else:
+                    resolved_sell_product, live_available_qty, inventory_source = manager.resolve_live_sell_inventory(
                         args.symbol,
                         args.exchange,
                         qty,
-                        old_product="D",
-                        new_product="I",
-                        transaction_type="BUY",
+                        preferred_product=linked_buy_product,
+                        trade_dt=basket_trade_dt,
                     )
-                    print(
-                        f"Converted same-day delivery position to intraday for {args.symbol} "
-                        f"before SELL."
-                    )
-                    if conversion_result.get("status") != "DRY_RUN":
-                        print(f"Conversion response: {conversion_result}")
-                except UpstoxOrderError as exc:
-                    print(
-                        f"SELL {args.symbol} skipped: unable to convert same-day "
-                        f"delivery position to intraday: {exc}"
-                    )
-                    return
-
-                resolved_sell_product = "I"
-                live_available_qty = qty
-                inventory_source = "converted"
-            else:
-                resolved_sell_product, live_available_qty, inventory_source = manager.resolve_live_sell_inventory(
-                    args.symbol,
-                    args.exchange,
-                    qty,
-                    preferred_product=linked_buy_product,
-                    trade_dt=linked_buy_dt,
+                order_value = float(qty) * float(args.ltp)
+                print(
+                    f"Resolved SELL qty from BASKET buy_ids={basket_buy_ids}: {qty}"
                 )
-            order_value = float(qty) * float(args.ltp)
-            print(
-                f"Resolved SELL qty from BUY signal_id={linked_buy_signal_id}: {qty}"
-            )
-            print(
-                f"Live Upstox {inventory_source} quantity for {args.symbol} on {args.exchange}: "
-                f"{live_available_qty}"
-            )
-            if linked_buy_product:
-                print(f"Linked BUY product: {linked_buy_product}")
-            print(f"Resolved SELL product: {resolved_sell_product}")
-            print(f"SELL order value: {order_value:.2f}")
-        except ValueError as exc:
-            print(f"SELL {args.symbol} skipped: {exc}")
-            return
-        except UpstoxOrderError as exc:
-            print(f"SELL {args.symbol} skipped: {exc}")
-            return
+                print(
+                    f"Live Upstox {inventory_source} quantity for {args.symbol} on {args.exchange}: "
+                    f"{live_available_qty}"
+                )
+                if linked_buy_product:
+                    print(f"Basket BUY product: {linked_buy_product}")
+                print(f"Resolved SELL product: {resolved_sell_product}")
+                print(f"SELL order value: {order_value:.2f}")
+            except ValueError as exc:
+                print(f"SELL {args.symbol} skipped: {exc}")
+                return
+            except UpstoxOrderError as exc:
+                print(f"SELL {args.symbol} skipped: {exc}")
+                return
+        else:
+            if args.signal_id is None:
+                print("SELL orders require --signal-id so the linked BUY quantity can be resolved.")
+                return
+
+            try:
+                qty, linked_buy_signal_id, linked_buy_product = resolve_sell_quantity(
+                    args.signal_id,
+                    db_path=db_path,
+                )
+                linked_buy_row = fetch_signal_row(linked_buy_signal_id, db_path=db_path)
+                linked_buy_product = str(linked_buy_product or "").upper() or None
+                linked_buy_dt = _parse_signal_date((linked_buy_row or {}).get("signal_timestamp"))
+                if linked_buy_dt is None:
+                    linked_buy_dt = _parse_signal_date((linked_buy_row or {}).get("action_timestamp"))
+                if linked_buy_dt is None:
+                    linked_buy_dt = _parse_signal_date((linked_buy_row or {}).get("signal_date"))
+                today_key = datetime.now().date()
+                should_convert_same_day = (
+                    linked_buy_product == "D"
+                    and linked_buy_dt is not None
+                    and linked_buy_dt.date() == today_key
+                )
+
+                if should_convert_same_day and manager.allow_live_orders:
+                    positions = manager.get_positions()
+                    live_same_day_qty = _available_positions_quantity(
+                        positions,
+                        args.symbol,
+                        args.exchange,
+                        product="D",
+                    )
+                    if live_same_day_qty <= 0:
+                        raise UpstoxOrderError(
+                            f"Insufficient live same-day positions for {args.symbol} on {args.exchange}. "
+                            f"Required {qty}, positions available {live_same_day_qty}."
+                        )
+                    if live_same_day_qty < qty:
+                        print(
+                            f"Same-day SELL quantity {qty} exceeds live same-day positions "
+                            f"{live_same_day_qty}; using available quantity."
+                        )
+                        qty = live_same_day_qty
+
+                    try:
+                        conversion_result = manager.convert_position(
+                            args.symbol,
+                            args.exchange,
+                            qty,
+                            old_product="D",
+                            new_product="I",
+                            transaction_type="BUY",
+                        )
+                        print(
+                            f"Converted same-day delivery position to intraday for {args.symbol} "
+                            f"before SELL."
+                        )
+                        if conversion_result.get("status") != "DRY_RUN":
+                            print(f"Conversion response: {conversion_result}")
+                    except UpstoxOrderError as exc:
+                        print(
+                            f"SELL {args.symbol} skipped: unable to convert same-day "
+                            f"delivery position to intraday: {exc}"
+                        )
+                        return
+
+                    resolved_sell_product = "I"
+                    live_available_qty = qty
+                    inventory_source = "converted"
+                else:
+                    resolved_sell_product, live_available_qty, inventory_source = manager.resolve_live_sell_inventory(
+                        args.symbol,
+                        args.exchange,
+                        qty,
+                        preferred_product=linked_buy_product,
+                        trade_dt=linked_buy_dt,
+                    )
+                order_value = float(qty) * float(args.ltp)
+                print(
+                    f"Resolved SELL qty from BUY signal_id={linked_buy_signal_id}: {qty}"
+                )
+                print(
+                    f"Live Upstox {inventory_source} quantity for {args.symbol} on {args.exchange}: "
+                    f"{live_available_qty}"
+                )
+                if linked_buy_product:
+                    print(f"Linked BUY product: {linked_buy_product}")
+                print(f"Resolved SELL product: {resolved_sell_product}")
+                print(f"SELL order value: {order_value:.2f}")
+            except ValueError as exc:
+                print(f"SELL {args.symbol} skipped: {exc}")
+                return
+            except UpstoxOrderError as exc:
+                print(f"SELL {args.symbol} skipped: {exc}")
+                return
 
     if args.confirm_order:
         try:

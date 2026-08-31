@@ -21,6 +21,7 @@ py live_rsi_tracking.py --hybrid --telegram
 from __future__ import annotations
 
 import argparse
+import importlib
 import os
 import sqlite3
 import subprocess
@@ -58,6 +59,9 @@ MARKET_OPEN_MINUTE = 20
 MARKET_CLOSE_HOUR = 15
 MARKET_CLOSE_MINUTE = 30
 SELL_AMC_CHARGE = 26.0
+DEFAULT_BASKET_SELL_RSI_THRESHOLD = 60.0
+DEFAULT_ORDER_BROKER = os.getenv("ORDER_EXECUTION_BROKER", "upstox").strip().lower() or "upstox"
+ORDER_BROKER_CHOICES = {"upstox", "zerodha"}
 
 BUY_OPEN_STATE = "OPEN"
 BUY_CLOSED_STATE = "CLOSED"
@@ -82,6 +86,21 @@ def quote_identifier(name: str) -> str:
     if "\x00" in name:
         raise ValueError("Identifier contains an invalid null byte.")
     return '"' + name.replace('"', '""') + '"'
+
+
+def _parse_signal_date(value: object) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(raw[:19], fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def parse_args() -> argparse.Namespace:
@@ -147,7 +166,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--confirmOrder",
         action="store_true",
-        help="Prompt for Y/N before placing each Upstox order.",
+        help="Prompt for Y/N before placing each broker order.",
+    )
+    parser.add_argument(
+        "--broker",
+        choices=sorted(ORDER_BROKER_CHOICES),
+        default=DEFAULT_ORDER_BROKER if DEFAULT_ORDER_BROKER in ORDER_BROKER_CHOICES else "upstox",
+        help="Broker used for live order execution.",
     )
     parser.add_argument(
         "--upstox-live",
@@ -169,6 +194,49 @@ def parse_args() -> argparse.Namespace:
         help="Disable the automatic after-hours quant_engine sync step.",
     )
     return parser.parse_args()
+
+
+def normalize_broker_name(value: str | None) -> str:
+    broker = str(value or "").strip().lower()
+    if broker in ORDER_BROKER_CHOICES:
+        return broker
+    return "upstox"
+
+
+def get_broker_env_var(broker: str) -> str:
+    broker = normalize_broker_name(broker)
+    if broker == "zerodha":
+        return "ZERODHA_ALLOW_LIVE_ORDERS"
+    return "UPSTOX_ALLOW_LIVE_ORDERS"
+
+
+def get_broker_script_path(broker: str) -> Path:
+    broker = normalize_broker_name(broker)
+    if broker == "zerodha":
+        return Path(__file__).resolve().parent / "zerodha_order_manager.py"
+    return Path(__file__).resolve().parent / "upstox_order_manager.py"
+
+
+def get_broker_module_name(broker: str) -> str:
+    broker = normalize_broker_name(broker)
+    if broker == "zerodha":
+        return "zerodha_order_manager"
+    return "upstox_order_manager"
+
+
+def get_broker_display_name(broker: str) -> str:
+    broker = normalize_broker_name(broker)
+    return "Zerodha" if broker == "zerodha" else "Upstox"
+
+
+def get_order_manager_class(broker: str):
+    module = importlib.import_module(get_broker_module_name(broker))
+    return getattr(module, "ZerodhaOrderManager", None) or getattr(module, "UpstoxOrderManager")
+
+
+def get_update_signal_execution_details(broker: str):
+    module = importlib.import_module(get_broker_module_name(broker))
+    return getattr(module, "update_signal_execution_details", None)
 
 
 def is_market_open_now(now: datetime | None = None) -> bool:
@@ -227,7 +295,8 @@ def ensure_signal_log_table(conn: sqlite3.Connection) -> None:
             buy_signal_id     INTEGER,
             trigger_exit_rsi  INTEGER,
             action_timestamp  TEXT,
-            closed_by_signal_id INTEGER
+            closed_by_signal_id INTEGER,
+            basket_buy_ids    TEXT
         )
         """
     )
@@ -242,6 +311,10 @@ def ensure_signal_log_table(conn: sqlite3.Connection) -> None:
     if "product" not in existing_cols:
         conn.execute(
             f"ALTER TABLE {quote_identifier(SIGNAL_LOG_TABLE)} ADD COLUMN product TEXT"
+        )
+    if "basket_buy_ids" not in existing_cols:
+        conn.execute(
+            f"ALTER TABLE {quote_identifier(SIGNAL_LOG_TABLE)} ADD COLUMN basket_buy_ids TEXT"
         )
     conn.execute(
         f"""
@@ -264,6 +337,7 @@ def ensure_signal_log_table(conn: sqlite3.Connection) -> None:
             trigger_exit_rsi  INTEGER,
             action_timestamp  TEXT,
             closed_by_signal_id INTEGER,
+            basket_buy_ids    TEXT,
             order_status      TEXT,
             order_reason      TEXT
         )
@@ -276,6 +350,7 @@ def ensure_signal_log_table(conn: sqlite3.Connection) -> None:
     for column_name, column_type in (
         ("qty", "INTEGER"),
         ("product", "TEXT"),
+        ("basket_buy_ids", "TEXT"),
         ("order_status", "TEXT"),
         ("order_reason", "TEXT"),
     ):
@@ -667,10 +742,13 @@ def has_open_buy_bucket(
     return row is not None
 
 
-def get_open_buy_rows(conn: sqlite3.Connection, source_table: str) -> list[tuple[int, int, int, float, int | None, str | None]]:
+def get_open_buy_rows(
+    conn: sqlite3.Connection,
+    source_table: str,
+) -> list[tuple[int, int, int, float, int | None, str | None, str | None]]:
     rows = conn.execute(
         f"""
-        SELECT id, entry_rsi, exit_rsi, ltp, qty, product
+        SELECT id, entry_rsi, exit_rsi, ltp, qty, product, signal_date
         FROM {quote_identifier(SIGNAL_LOG_TABLE)}
         WHERE trim(upper(source_table)) = trim(upper(?))
           AND signal_type = 'BUY'
@@ -687,9 +765,64 @@ def get_open_buy_rows(conn: sqlite3.Connection, source_table: str) -> list[tuple
             float(row[3]),
             None if row[4] is None else int(row[4]),
             None if row[5] is None else str(row[5]),
+            None if row[6] is None else str(row[6]),
         )
         for row in rows
     ]
+
+
+def get_open_basket_buy_rows(
+    conn: sqlite3.Connection,
+    source_table: str,
+    current_signal_date: str,
+    current_rsi: float,
+) -> tuple[
+    list[tuple[int, int, int, float, int, str | None, str | None]],
+    list[int],
+]:
+    eligible: list[tuple[int, int, int, float, int, str | None, str | None]] = []
+    excluded_today: list[int] = []
+    for buy_id, entry_rsi, exit_rsi, buy_ltp, buy_qty, buy_product, buy_signal_date in get_open_buy_rows(conn, source_table):
+        if buy_qty is None or int(buy_qty) <= 0:
+            continue
+        parsed_buy_date = _parse_signal_date(buy_signal_date)
+        if parsed_buy_date is not None and parsed_buy_date.date().isoformat() == current_signal_date:
+            excluded_today.append(int(buy_id))
+            continue
+        if float(current_rsi) <= float(exit_rsi):
+            continue
+        eligible.append(
+            (
+                int(buy_id),
+                int(entry_rsi),
+                int(exit_rsi),
+                float(buy_ltp),
+                int(buy_qty),
+                buy_product,
+                buy_signal_date,
+            )
+        )
+    return eligible, excluded_today
+
+
+def group_open_basket_buy_rows_by_product(
+    conn: sqlite3.Connection,
+    source_table: str,
+    current_signal_date: str,
+    current_rsi: float,
+) -> tuple[
+    dict[str, list[tuple[int, int, int, float, int, str | None, str | None]]],
+    list[int],
+]:
+    grouped: dict[str, list[tuple[int, int, int, float, int, str | None, str | None]]] = {}
+    excluded_today: list[int] = []
+    rows, excluded_today = get_open_basket_buy_rows(conn, source_table, current_signal_date, current_rsi)
+    for row in rows:
+        product_key = str(row[5] or "").strip().upper()
+        if product_key not in {"D", "I"}:
+            continue
+        grouped.setdefault(product_key, []).append(row)
+    return grouped, excluded_today
 
 
 def has_buy_entry_rsi(conn: sqlite3.Connection, source_table: str, entry_rsi: int) -> bool:
@@ -741,6 +874,275 @@ def close_buy_bucket(
         (BUY_CLOSED_STATE, signal_timestamp, sell_id, buy_id),
     )
     conn.commit()
+
+
+def close_buy_buckets(
+    conn: sqlite3.Connection,
+    buy_ids: list[int],
+    sell_id: int,
+    signal_timestamp: str,
+) -> None:
+    if not buy_ids:
+        return
+
+    placeholders = ",".join("?" for _ in buy_ids)
+    params: list[object] = [BUY_CLOSED_STATE, signal_timestamp, sell_id, *buy_ids]
+    conn.execute(
+        f"""
+        UPDATE {quote_identifier(SIGNAL_LOG_TABLE)}
+        SET position_state = ?,
+            action_timestamp = ?,
+            closed_by_signal_id = ?
+        WHERE id IN ({placeholders})
+          AND signal_type = 'BUY'
+          AND COALESCE(position_state, '{BUY_OPEN_STATE}') = '{BUY_OPEN_STATE}'
+        """,
+        params,
+    )
+    conn.commit()
+
+
+def attempt_basket_sell(
+    conn: sqlite3.Connection,
+    source_table: str,
+    current_rsi: float,
+    ltp: float,
+    latest_close: float | None,
+    signal_date: str,
+    signal_timestamp: str,
+    basket_buy_rows: list[tuple[int, int, int, float, int, str | None, str | None]],
+    excluded_today_buy_ids: list[int],
+    min_profit_pct: float,
+    send_to_telegram: bool,
+    telegram_bot_token: str | None,
+    telegram_chat_id: str | None,
+    broker: str,
+    confirm_order: bool,
+    dry_run: bool,
+) -> bool:
+    if len(basket_buy_rows) < 2 or float(current_rsi) < float(DEFAULT_BASKET_SELL_RSI_THRESHOLD):
+        return False
+
+    basket_buy_ids = [int(row[0]) for row in basket_buy_rows]
+    basket_qty = sum(int(row[4]) for row in basket_buy_rows)
+    basket_cost = sum(float(row[3]) * int(row[4]) for row in basket_buy_rows)
+    if basket_qty <= 0:
+        return False
+
+    basket_avg_buy = basket_cost / basket_qty
+    basket_sell_value = float(ltp) * float(basket_qty)
+    basket_pnl = round(basket_sell_value - basket_cost, 2)
+    basket_pnl_pct = round(((float(ltp) - float(basket_avg_buy)) / float(basket_avg_buy)) * 100.0, 4) if basket_avg_buy else 0.0
+    basket_buy_ids_text = ",".join(str(buy_id) for buy_id in basket_buy_ids)
+    basket_detail_text = "; ".join(
+        f"id={buy_id} entry={entry_rsi} exit={exit_rsi} buy_ltp={buy_ltp:.2f} qty={qty} date={buy_date}"
+        for buy_id, entry_rsi, exit_rsi, buy_ltp, qty, _product, buy_date in basket_buy_rows
+    )
+    excluded_today_text = ",".join(str(buy_id) for buy_id in excluded_today_buy_ids) if excluded_today_buy_ids else "none"
+    basket_notes = (
+        f"BASKET SELL | buy_ids=[{basket_buy_ids_text}] | avg_buy={basket_avg_buy:.2f} | "
+        f"qty={basket_qty} | buy_cost={basket_cost:.2f} | sell_value={basket_sell_value:.2f} | "
+        f"PnL={basket_pnl:.2f} ({basket_pnl_pct:.4f}%) | RSI={current_rsi:.2f} | "
+        f"details={basket_detail_text} | excluded_today_buy_ids={excluded_today_text}"
+    )
+
+    if float(ltp) <= float(basket_avg_buy):
+        print(
+            f"Skipping basket SELL {source_table}: "
+            f"LTP={ltp:.2f} <= basket_avg_buy={basket_avg_buy:.2f} even though RSI={current_rsi:.2f} >= {DEFAULT_BASKET_SELL_RSI_THRESHOLD:.2f}"
+        )
+        return False
+
+    if basket_pnl_pct <= float(min_profit_pct):
+        print(
+            f"Skipping basket SELL {source_table}: "
+            f"profit={basket_pnl_pct:.4f}% <= min_profit_pct={min_profit_pct}"
+        )
+        return False
+
+    if basket_pnl <= SELL_AMC_CHARGE:
+        print(
+            f"Skipping basket SELL {source_table}: "
+            f"PnL={basket_pnl:.2f} <= AMC charge {SELL_AMC_CHARGE:.2f}"
+        )
+        return False
+
+    _print_live_signal_context(source_table, current_rsi, latest_close, ltp)
+    basket_message = (
+        f"SELL {source_table} | basket_buy_ids=[{basket_buy_ids_text}] | "
+        f"avg_buy={basket_avg_buy:.2f} | qty={basket_qty} | "
+        f"SELL LTP {ltp:.2f} | PnL {basket_pnl:.2f} ({basket_pnl_pct:.4f}%) | "
+        f"RSI {current_rsi:.2f} | excluded_today_buy_ids={excluded_today_text}"
+    )
+    print(basket_message)
+
+    if confirm_order:
+        prompt = (
+            f"Confirm BASKET SELL {source_table} | qty={basket_qty} | "
+            f"avg_buy={basket_avg_buy:.2f} | SELL LTP={ltp:.2f} | PnL={basket_pnl:.2f} ? [Y/N]: "
+        )
+        if not _prompt_order_confirmation(prompt):
+            fail_reason = "user declined basket order confirmation"
+            print(f"BASKET SELL {source_table} skipped: {fail_reason}.")
+            inserted_id = insert_signal_row(
+                conn,
+                {
+                    "source_table": source_table,
+                    "signal_type": "SELL",
+                    "entry_rsi": int(basket_buy_rows[0][1]),
+                    "exit_rsi": int(basket_buy_rows[0][2]),
+                    "previous_rsi": current_rsi,
+                    "current_rsi": current_rsi,
+                    "ltp": ltp,
+                    "qty": basket_qty,
+                    "product": basket_buy_rows[0][5],
+                    "signal_date": signal_date,
+                    "signal_timestamp": signal_timestamp,
+                    "notes": f"SKIPPED | {fail_reason} | {basket_notes}",
+                    "position_state": SELL_CONFIRMED_STATE,
+                    "buy_signal_id": None,
+                    "trigger_exit_rsi": int(basket_buy_rows[0][2]),
+                    "action_timestamp": signal_timestamp,
+                    "closed_by_signal_id": None,
+                    "basket_buy_ids": basket_buy_ids_text,
+                },
+                table_name=ALL_SIGNAL_LOG_TABLE,
+                order_status="SKIPPED",
+                order_reason=fail_reason,
+            )
+            _send_telegram_if_new_all_signal(
+                inserted_id,
+                basket_message,
+                send_to_telegram,
+                telegram_bot_token,
+                telegram_chat_id,
+            )
+            return True
+
+    if dry_run:
+        print(
+            f"BASKET SELL TAKING PLACE {source_table} | "
+            f"buy_ids=[{basket_buy_ids_text}] | avg_buy={basket_avg_buy:.2f} | "
+            f"final_pnl={basket_pnl:.2f}"
+        )
+        inserted_id = insert_signal_row(
+            conn,
+            {
+                "source_table": source_table,
+                "signal_type": "SELL",
+                "entry_rsi": int(basket_buy_rows[0][1]),
+                "exit_rsi": int(basket_buy_rows[0][2]),
+                "previous_rsi": current_rsi,
+                "current_rsi": current_rsi,
+                "ltp": ltp,
+                "qty": basket_qty,
+                "product": basket_buy_rows[0][5],
+                "signal_date": signal_date,
+                "signal_timestamp": signal_timestamp,
+                "notes": f"DRY_RUN | {basket_notes}",
+                "position_state": SELL_CONFIRMED_STATE,
+                "buy_signal_id": None,
+                "trigger_exit_rsi": int(basket_buy_rows[0][2]),
+                "action_timestamp": signal_timestamp,
+                "closed_by_signal_id": None,
+                "basket_buy_ids": basket_buy_ids_text,
+            },
+            table_name=ALL_SIGNAL_LOG_TABLE,
+            order_status="DRY_RUN",
+            order_reason="dry run",
+        )
+        _send_telegram_if_new_all_signal(
+            inserted_id,
+            basket_message,
+            send_to_telegram,
+            telegram_bot_token,
+            telegram_chat_id,
+        )
+        return True
+
+    order_result = trigger_order_execution(
+        "SELL",
+        source_table,
+        ltp,
+        broker=broker,
+        confirm_order=False,
+        basket_buy_ids=basket_buy_ids,
+    )
+    if not order_result.get("success"):
+        fail_reason = _failure_reason_from_order_result(order_result)
+        print(f"SELL {source_table} skipped: {fail_reason}.")
+        inserted_id = insert_signal_row(
+            conn,
+            {
+                "source_table": source_table,
+                "signal_type": "SELL",
+                "entry_rsi": int(basket_buy_rows[0][1]),
+                "exit_rsi": int(basket_buy_rows[0][2]),
+                "previous_rsi": current_rsi,
+                "current_rsi": current_rsi,
+                "ltp": ltp,
+                "qty": basket_qty,
+                "product": basket_buy_rows[0][5],
+                "signal_date": signal_date,
+                "signal_timestamp": signal_timestamp,
+                "notes": f"SKIPPED | {fail_reason} | {basket_notes}",
+                "position_state": SELL_CONFIRMED_STATE,
+                "buy_signal_id": None,
+                "trigger_exit_rsi": int(basket_buy_rows[0][2]),
+                "action_timestamp": signal_timestamp,
+                "closed_by_signal_id": None,
+                "basket_buy_ids": basket_buy_ids_text,
+            },
+            table_name=ALL_SIGNAL_LOG_TABLE,
+            order_status="SKIPPED",
+            order_reason=fail_reason,
+        )
+        _send_telegram_if_new_all_signal(
+            inserted_id,
+            basket_message,
+            send_to_telegram,
+            telegram_bot_token,
+            telegram_chat_id,
+        )
+        return True
+
+    order_id = str(order_result.get("order_id") or "").strip()
+    if not order_id:
+        print(f"SELL {source_table} skipped: Upstox did not return an order id.")
+        return True
+
+    print(
+        f"BASKET SELL TAKING PLACE {source_table} | "
+        f"buy_ids=[{basket_buy_ids_text}] | avg_buy={basket_avg_buy:.2f} | "
+        f"final_pnl={basket_pnl:.2f}"
+    )
+    resolved_qty = int(order_result.get("qty") or basket_qty)
+    resolved_product = str(order_result.get("product") or basket_buy_rows[0][5] or "").strip() or None
+    basket_sell_id = insert_signal_row(
+        conn,
+        {
+            "source_table": source_table,
+            "signal_type": "SELL",
+            "entry_rsi": int(basket_buy_rows[0][1]),
+            "exit_rsi": int(basket_buy_rows[0][2]),
+            "previous_rsi": current_rsi,
+            "current_rsi": current_rsi,
+            "ltp": ltp,
+            "qty": resolved_qty,
+            "product": resolved_product,
+            "signal_date": signal_date,
+            "signal_timestamp": signal_timestamp,
+            "notes": basket_notes,
+            "position_state": SELL_CONFIRMED_STATE,
+            "buy_signal_id": None,
+            "trigger_exit_rsi": int(basket_buy_rows[0][2]),
+            "action_timestamp": signal_timestamp,
+            "closed_by_signal_id": None,
+            "basket_buy_ids": basket_buy_ids_text,
+        },
+    )
+    close_buy_buckets(conn, basket_buy_ids, basket_sell_id, signal_timestamp)
+    return True
 
 
 def get_buy_signal_reason_latest_rsi(current_rsi: float, entry_rsi: int, exit_rsi: int) -> str | None:
@@ -1003,10 +1405,11 @@ def insert_signal_row(
                 trigger_exit_rsi,
                 action_timestamp,
                 closed_by_signal_id,
+                basket_buy_ids,
                 order_status,
                 order_reason
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 row["source_table"],
@@ -1026,6 +1429,7 @@ def insert_signal_row(
                 row["trigger_exit_rsi"],
                 row["action_timestamp"],
                 row["closed_by_signal_id"],
+                row.get("basket_buy_ids"),
                 order_status,
                 order_reason,
             ),
@@ -1052,9 +1456,10 @@ def insert_signal_row(
                 buy_signal_id,
                 trigger_exit_rsi,
                 action_timestamp,
-                closed_by_signal_id
+                closed_by_signal_id,
+                basket_buy_ids
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 row["source_table"],
@@ -1074,6 +1479,7 @@ def insert_signal_row(
                 row["trigger_exit_rsi"],
                 row["action_timestamp"],
                 row["closed_by_signal_id"],
+                row.get("basket_buy_ids"),
             ),
         )
     conn.commit()
@@ -1084,35 +1490,42 @@ def trigger_order_execution(
     side: str,
     symbol: str,
     ltp: float,
+    broker: str,
     confirm_order: bool = False,
     signal_id: int | None = None,
+    basket_buy_ids: list[int] | None = None,
 ) -> dict[str, object]:
-    script_path = Path(__file__).resolve().parent / "upstox_order_manager.py"
+    broker = normalize_broker_name(broker)
+    script_path = get_broker_script_path(broker)
     if not script_path.exists():
         print(f"Skipping order execution: {script_path.name} not found.")
         return {"success": False, "reason": "order manager not found"}
 
-    if os.getenv("UPSTOX_ALLOW_LIVE_ORDERS", "false").lower() != "true":
+    env_var = get_broker_env_var(broker)
+    if os.getenv(env_var, "false").lower() != "true":
         print(
             f"Skipping order execution for {side} {symbol}: "
-            "UPSTOX_ALLOW_LIVE_ORDERS is not true."
+            f"{env_var} is not true."
         )
         return {"success": False, "reason": "live orders disabled"}
 
     if side.upper() == "BUY":
         try:
-            from upstox_order_manager import UpstoxOrderManager
-
-            funds_manager = UpstoxOrderManager()
+            order_manager_class = get_order_manager_class(broker)
+            funds_manager = order_manager_class()
             available_funds = funds_manager.get_available_margin()
-            print(f"Available Upstox funds: {available_funds:.2f}")
-            if available_funds <= 0:
-                print("No available funds in Upstox")
+            broker_label = get_broker_display_name(broker)
+            if available_funds is None:
+                print(f"Available {broker_label} funds: unavailable")
+            else:
+                print(f"Available {broker_label} funds: {available_funds:.2f}")
+            if available_funds is not None and available_funds <= 0:
+                print(f"No available funds in {broker_label}")
                 return {"success": False, "reason": "funds lower than per trade value"}
         except Exception as exc:
-            print(f"Unable to read Upstox funds before BUY {symbol}: {exc}")
+            print(f"Unable to read {get_broker_display_name(broker)} funds before BUY {symbol}: {exc}")
             return {"success": False, "reason": str(exc)}
-    elif signal_id is None:
+    elif signal_id is None and not basket_buy_ids:
         print(f"Skipping order execution for SELL {symbol}: signal id is required.")
         return {"success": False, "reason": "missing signal id"}
 
@@ -1132,6 +1545,10 @@ def trigger_order_execution(
         ]
         if side.upper() == "SELL" and signal_id is not None:
             cmd.extend(["--signal-id", str(int(signal_id))])
+        if side.upper() == "SELL" and basket_buy_ids:
+            basket_arg = ",".join(str(int(buy_id)) for buy_id in basket_buy_ids if int(buy_id) > 0)
+            if basket_arg:
+                cmd.extend(["--basket-buy-ids", basket_arg])
         completed = subprocess.run(
             cmd,
             check=False,
@@ -1147,7 +1564,7 @@ def trigger_order_execution(
 
         if completed.returncode != 0:
             print(
-                f"Upstox order manager failed for {side} {symbol} "
+                f"{get_broker_display_name(broker)} order manager failed for {side} {symbol} "
                 f"with exit code {completed.returncode}."
             )
             return {
@@ -1168,6 +1585,9 @@ def trigger_order_execution(
             if m:
                 qty = int(m.group(1))
             m = re.search(r"Resolved SELL qty from BUY signal_id=.*:\s*(\d+)", line)
+            if m:
+                qty = int(m.group(1))
+            m = re.search(r"Resolved SELL qty from BASKET buy_ids=.*:\s*(\d+)", line)
             if m:
                 qty = int(m.group(1))
             m = re.search(r"Resolved SELL product:\s*([A-Z]+)", line)
@@ -1208,7 +1628,7 @@ def trigger_order_execution(
         if order_id is None:
             return {
                 "success": False,
-                "reason": "Upstox order was not placed",
+                "reason": f"{get_broker_display_name(broker)} order was not placed",
                 "exit_code": completed.returncode,
                 "stdout": stdout_text,
                 "stderr": stderr_text,
@@ -1231,7 +1651,7 @@ def trigger_order_execution(
             "order_id": order_id,
         }
     except Exception as exc:
-        print(f"Failed to launch upstox_order_manager.py for {side} {symbol}: {exc}")
+        print(f"Failed to launch {script_path.name} for {side} {symbol}: {exc}")
         return {"success": False, "reason": str(exc)}
 
 
@@ -1249,13 +1669,19 @@ def _failure_reason_from_order_result(order_result: dict[str, object]) -> str:
     explicit_markers = (
         "Funds are lower than Per trade value",
         "Insufficient Upstox funds",
+        "Insufficient Zerodha margin",
+        "Unable to read Zerodha funds",
+        "Failed to place Zerodha order",
         "Unable to read Upstox funds",
         "SELL orders require --signal-id",
         "Linked BUY signal row",
         "Insufficient live Upstox inventory",
+        "Insufficient live Zerodha inventory",
         "Upstox order manager failed",
+        "Zerodha order manager failed",
         "ValueError:",
         "Upstox API error",
+        "KiteConnect error",
         "Network error while calling Upstox",
     )
     for marker in explicit_markers:
@@ -1370,6 +1796,7 @@ def handle_source_table(
     telegram_chat_id: str | None = None,
     min_profit_pct: float = 0.0,
     buy_rsi_protection: float = 0.0,
+    broker: str = "upstox",
     confirm_order: bool = False,
  ) -> None:
     table_rules = heatmap_df[heatmap_df["source_table"] == source_table]
@@ -1381,8 +1808,41 @@ def handle_source_table(
         ascending=[True, True],
     )
 
+    # Basket SELL: driven by row-level exit_rsi crossings.
+    basket_executed = False
+    basket_groups, excluded_today_buy_ids = group_open_basket_buy_rows_by_product(
+        conn,
+        source_table,
+        signal_date,
+        current_rsi,
+    )
+    for basket_product, basket_buy_rows in basket_groups.items():
+        if len(basket_buy_rows) < 2:
+            continue
+        if attempt_basket_sell(
+            conn,
+            source_table,
+            current_rsi,
+            ltp,
+            latest_close,
+            signal_date,
+            signal_timestamp,
+            basket_buy_rows,
+            excluded_today_buy_ids,
+            min_profit_pct,
+            send_to_telegram,
+            telegram_bot_token,
+            telegram_chat_id,
+            broker,
+            confirm_order,
+            dry_run,
+        ):
+            basket_executed = True
+    if basket_executed:
+        return
+
     # First attempt to close any open BUY buckets with matching exit conditions.
-    for buy_id, buy_entry_rsi, buy_exit_rsi, buy_ltp, buy_qty, buy_product in get_open_buy_rows(conn, source_table):
+    for buy_id, buy_entry_rsi, buy_exit_rsi, buy_ltp, buy_qty, buy_product, buy_signal_date in get_open_buy_rows(conn, source_table):
         if buy_qty is None or int(buy_qty) <= 0:
             continue
         sell_reason = get_sell_signal_reason_latest_rsi(current_rsi, buy_exit_rsi)
@@ -1524,6 +1984,7 @@ def handle_source_table(
             "SELL",
             source_table,
             ltp,
+            broker=broker,
             confirm_order=False,
             signal_id=buy_id,
         )
@@ -1574,20 +2035,21 @@ def handle_source_table(
             return
 
         try:
-            from upstox_order_manager import update_signal_execution_details
+            update_signal_execution_details = get_update_signal_execution_details(broker)
 
             resolved_qty = int(order_result.get("qty") or qty)
             resolved_product = str(order_result.get("product") or buy_product or "").strip() or None
-            if update_signal_execution_details(
-                buy_id,
-                resolved_qty,
-                resolved_product,
-                db_path=DB_PATH,
-            ):
-                print(
-                    f"Updated {SIGNAL_LOG_TABLE} for signal_id={buy_id} "
-                    f"with qty={resolved_qty}."
-                )
+            if update_signal_execution_details is not None:
+                if update_signal_execution_details(
+                    buy_id,
+                    resolved_qty,
+                    resolved_product,
+                    db_path=DB_PATH,
+                ):
+                    print(
+                        f"Updated {SIGNAL_LOG_TABLE} for signal_id={buy_id} "
+                        f"with qty={resolved_qty}."
+                    )
         except Exception as exc:
             print(
                 f"Warning: failed to update execution details for signal_id={buy_id}: {exc}"
@@ -1838,7 +2300,7 @@ def handle_source_table(
             )
             return
 
-        order_result = trigger_order_execution("BUY", source_table, ltp, confirm_order=False)
+        order_result = trigger_order_execution("BUY", source_table, ltp, broker=broker, confirm_order=False)
         if not order_result.get("success"):
             fail_reason = _failure_reason_from_order_result(order_result)
             fail_message = f"BUY {source_table} skipped: {fail_reason}."
@@ -1947,6 +2409,7 @@ def handle_source_table(
 
 def main() -> None:
     args = parse_args()
+    broker = normalize_broker_name(getattr(args, "broker", None))
     def _mask_val(v: str | None) -> str:
         if not v:
             return ""
@@ -1977,6 +2440,7 @@ def main() -> None:
     print("\nStartup configuration summary")
     print("-" * 48)
     print(f"Interval: {getattr(args, 'interval', DEFAULT_INTERVAL_SECONDS)}s   Symbols: {symbols_display}")
+    print(f"Broker: {broker}")
     print(f"Confirm order: {getattr(args, 'confirmOrder', False)}")
     print(f"Telegram: {'ENABLED' if getattr(args, 'telegram', False) else 'DISABLED'}  token_sample={bot_sample} chat_sample={chat_sample}")
     print("BUY sizing: PER_TRADE_VALUE is the maximum order cap, with DAILY_LIMIT and available funds checks.")
@@ -1994,14 +2458,17 @@ def main() -> None:
 
     if args.upstox_live:
         try:
-            from upstox_order_manager import UpstoxOrderManager
-
-            funds_manager = UpstoxOrderManager()
+            order_manager_class = get_order_manager_class(broker)
+            funds_manager = order_manager_class()
             available_funds = funds_manager.get_available_margin()
-            print(f"Available Upstox funds: {available_funds:.2f}")
+            broker_label = get_broker_display_name(broker)
+            if available_funds is None:
+                print(f"Available {broker_label} funds: unavailable")
+            else:
+                print(f"Available {broker_label} funds: {available_funds:.2f}")
             print("-" * 48 + "\n")
         except Exception as exc:
-            print(f"Unable to read Upstox available funds at startup: {exc}")
+            print(f"Unable to read {get_broker_display_name(broker)} available funds at startup: {exc}")
             print("-" * 48 + "\n")
 
     if getattr(args, "sync_daily_data", True):
@@ -2112,6 +2579,7 @@ def main() -> None:
                     telegram_chat_id=getattr(args, "telegram_chat_id", None),
                     min_profit_pct=getattr(args, "min_profit_pct", 0.0),
                     buy_rsi_protection=getattr(args, "buy_rsi_protection", 0.0),
+                    broker=broker,
                     confirm_order=getattr(args, "confirmOrder", False),
                 )
 
