@@ -14,14 +14,16 @@ Usage:
     py live_rsi_tracking.py --hybrid --buy-rsi-protection 1.0 --telegram --confirmOrder
     py live_rsi_tracking.py --hybrid --telegram --confirmOrder --buy-rsi-protection 1.0
 
-$env:UPSTOX_ALLOW_LIVE_ORDERS="true"
+$env:ORDER_EXECUTION_BROKER="zerodha"
+$env:ZERODHA_ALLOW_LIVE_ORDERS="true"
 py live_rsi_tracking.py --hybrid --telegram
+
+Live prices continue to come from Upstox. BUY/SELL order placement goes to Zerodha.
 """
 
 from __future__ import annotations
 
 import argparse
-import importlib
 import os
 import sqlite3
 import subprocess
@@ -58,10 +60,10 @@ MARKET_OPEN_HOUR = 9
 MARKET_OPEN_MINUTE = 20
 MARKET_CLOSE_HOUR = 15
 MARKET_CLOSE_MINUTE = 30
-SELL_AMC_CHARGE = 26.0
+SELL_AMC_CHARGE = 19.0
 DEFAULT_BASKET_SELL_RSI_THRESHOLD = 60.0
-DEFAULT_ORDER_BROKER = os.getenv("ORDER_EXECUTION_BROKER", "upstox").strip().lower() or "upstox"
-ORDER_BROKER_CHOICES = {"upstox", "zerodha"}
+DEFAULT_ORDER_BROKER = "zerodha"
+ORDER_BROKER_CHOICES = {"zerodha"}
 
 BUY_OPEN_STATE = "OPEN"
 BUY_CLOSED_STATE = "CLOSED"
@@ -171,8 +173,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--broker",
         choices=sorted(ORDER_BROKER_CHOICES),
-        default=DEFAULT_ORDER_BROKER if DEFAULT_ORDER_BROKER in ORDER_BROKER_CHOICES else "upstox",
-        help="Broker used for live order execution.",
+        default=DEFAULT_ORDER_BROKER,
+        help="Order execution broker. Zerodha is the only supported execution broker.",
     )
     parser.add_argument(
         "--upstox-live",
@@ -197,46 +199,35 @@ def parse_args() -> argparse.Namespace:
 
 
 def normalize_broker_name(value: str | None) -> str:
-    broker = str(value or "").strip().lower()
-    if broker in ORDER_BROKER_CHOICES:
-        return broker
-    return "upstox"
+    return "zerodha"
 
 
 def get_broker_env_var(broker: str) -> str:
-    broker = normalize_broker_name(broker)
-    if broker == "zerodha":
-        return "ZERODHA_ALLOW_LIVE_ORDERS"
-    return "UPSTOX_ALLOW_LIVE_ORDERS"
+    return "ZERODHA_ALLOW_LIVE_ORDERS"
 
 
 def get_broker_script_path(broker: str) -> Path:
-    broker = normalize_broker_name(broker)
-    if broker == "zerodha":
-        return Path(__file__).resolve().parent / "zerodha_order_manager.py"
-    return Path(__file__).resolve().parent / "upstox_order_manager.py"
+    return Path(__file__).resolve().parent / "zerodha_order_manager.py"
 
 
 def get_broker_module_name(broker: str) -> str:
-    broker = normalize_broker_name(broker)
-    if broker == "zerodha":
-        return "zerodha_order_manager"
-    return "upstox_order_manager"
+    return "zerodha_order_manager"
 
 
 def get_broker_display_name(broker: str) -> str:
-    broker = normalize_broker_name(broker)
-    return "Zerodha" if broker == "zerodha" else "Upstox"
+    return "Zerodha"
 
 
 def get_order_manager_class(broker: str):
-    module = importlib.import_module(get_broker_module_name(broker))
-    return getattr(module, "ZerodhaOrderManager", None) or getattr(module, "UpstoxOrderManager")
+    from zerodha_order_manager import ZerodhaOrderManager
+
+    return ZerodhaOrderManager
 
 
 def get_update_signal_execution_details(broker: str):
-    module = importlib.import_module(get_broker_module_name(broker))
-    return getattr(module, "update_signal_execution_details", None)
+    from zerodha_order_manager import update_signal_execution_details
+
+    return update_signal_execution_details
 
 
 def is_market_open_now(now: datetime | None = None) -> bool:
@@ -1069,7 +1060,7 @@ def attempt_basket_sell(
         basket_buy_ids=basket_buy_ids,
     )
     if not order_result.get("success"):
-        fail_reason = _failure_reason_from_order_result(order_result)
+        fail_reason = _failure_reason_from_order_result(order_result, broker=broker)
         print(f"SELL {source_table} skipped: {fail_reason}.")
         inserted_id = insert_signal_row(
             conn,
@@ -1498,16 +1489,13 @@ def trigger_order_execution(
     broker = normalize_broker_name(broker)
     script_path = get_broker_script_path(broker)
     if not script_path.exists():
-        print(f"Skipping order execution: {script_path.name} not found.")
-        return {"success": False, "reason": "order manager not found"}
+        raise RuntimeError(f"Order manager not found: {script_path.name}")
 
     env_var = get_broker_env_var(broker)
     if os.getenv(env_var, "false").lower() != "true":
-        print(
-            f"Skipping order execution for {side} {symbol}: "
-            f"{env_var} is not true."
+        raise RuntimeError(
+            f"Live order execution is disabled. Set {env_var}=true before placing {side} {symbol}."
         )
-        return {"success": False, "reason": "live orders disabled"}
 
     if side.upper() == "BUY":
         try:
@@ -1520,14 +1508,13 @@ def trigger_order_execution(
             else:
                 print(f"Available {broker_label} funds: {available_funds:.2f}")
             if available_funds is not None and available_funds <= 0:
-                print(f"No available funds in {broker_label}")
-                return {"success": False, "reason": "funds lower than per trade value"}
+                raise RuntimeError(f"No available funds in {broker_label}.")
         except Exception as exc:
-            print(f"Unable to read {get_broker_display_name(broker)} funds before BUY {symbol}: {exc}")
-            return {"success": False, "reason": str(exc)}
+            raise RuntimeError(
+                f"Unable to read {get_broker_display_name(broker)} funds before BUY {symbol}: {exc}"
+            ) from exc
     elif signal_id is None and not basket_buy_ids:
-        print(f"Skipping order execution for SELL {symbol}: signal id is required.")
-        return {"success": False, "reason": "missing signal id"}
+        raise RuntimeError(f"SELL {symbol} requires --signal-id or --basket-buy-ids.")
 
     try:
         cmd = [
@@ -1563,16 +1550,12 @@ def trigger_order_execution(
             print(stderr_text, end="" if stderr_text.endswith("\n") else "\n")
 
         if completed.returncode != 0:
-            print(
+            raise RuntimeError(
                 f"{get_broker_display_name(broker)} order manager failed for {side} {symbol} "
-                f"with exit code {completed.returncode}."
+                f"with exit code {completed.returncode}.\n"
+                f"stdout:\n{stdout_text}\n"
+                f"stderr:\n{stderr_text}"
             )
-            return {
-                "success": False,
-                "exit_code": completed.returncode,
-                "stdout": stdout_text,
-                "stderr": stderr_text,
-            }
 
         qty = None
         product = None
@@ -1593,7 +1576,7 @@ def trigger_order_execution(
             m = re.search(r"Resolved SELL product:\s*([A-Z]+)", line)
             if m:
                 product = m.group(1)
-            m = re.search(r"Available Upstox funds:\s*([0-9]+(?:\.[0-9]+)?)", line)
+            m = re.search(r"Available (?:Upstox funds|Zerodha margin):\s*([0-9]+(?:\.[0-9]+)?)", line)
             if m:
                 available_funds = float(m.group(1))
             m = re.search(r"Proposed value:\s*([0-9]+(?:\.[0-9]+)?)", line)
@@ -1626,18 +1609,11 @@ def trigger_order_execution(
                     break
 
         if order_id is None:
-            return {
-                "success": False,
-                "reason": f"{get_broker_display_name(broker)} order was not placed",
-                "exit_code": completed.returncode,
-                "stdout": stdout_text,
-                "stderr": stderr_text,
-                "qty": qty,
-                "product": product,
-                "available_funds": available_funds,
-                "order_value": order_value,
-                "order_id": None,
-            }
+            raise RuntimeError(
+                f"{get_broker_display_name(broker)} order was not placed for {side} {symbol}.\n"
+                f"stdout:\n{stdout_text}\n"
+                f"stderr:\n{stderr_text}"
+            )
 
         return {
             "success": True,
@@ -1651,11 +1627,11 @@ def trigger_order_execution(
             "order_id": order_id,
         }
     except Exception as exc:
-        print(f"Failed to launch {script_path.name} for {side} {symbol}: {exc}")
-        return {"success": False, "reason": str(exc)}
+        raise RuntimeError(f"Failed to launch {script_path.name} for {side} {symbol}: {exc}") from exc
 
 
-def _failure_reason_from_order_result(order_result: dict[str, object]) -> str:
+def _failure_reason_from_order_result(order_result: dict[str, object], broker: str = "upstox") -> str:
+    broker_label = get_broker_display_name(broker)
     reason = str(order_result.get("reason") or "").strip()
     if reason:
         return reason
@@ -1664,7 +1640,7 @@ def _failure_reason_from_order_result(order_result: dict[str, object]) -> str:
     stderr_text = str(order_result.get("stderr") or "").strip()
     combined = "\n".join(part for part in (stdout_text, stderr_text) if part)
     if not combined:
-        return "order was not placed on Upstox"
+        return f"order was not placed on {broker_label}"
 
     explicit_markers = (
         "Funds are lower than Per trade value",
@@ -1699,7 +1675,7 @@ def _failure_reason_from_order_result(order_result: dict[str, object]) -> str:
     lines = [line.strip() for line in combined.splitlines() if line.strip()]
     if lines:
         return lines[-1]
-    return "order was not placed on Upstox"
+    return f"order was not placed on {broker_label}"
 
 
 def _prompt_order_confirmation(message: str) -> bool:
@@ -1989,7 +1965,7 @@ def handle_source_table(
             signal_id=buy_id,
         )
         if not order_result.get("success"):
-            fail_reason = _failure_reason_from_order_result(order_result)
+            fail_reason = _failure_reason_from_order_result(order_result, broker=broker)
             fail_message = f"SELL {source_table} skipped: {fail_reason}."
             print(fail_message)
             inserted_id = insert_signal_row(
@@ -2159,10 +2135,9 @@ def handle_source_table(
         print(message)
         if confirm_order:
             try:
-                from upstox_order_manager import (
+                from zerodha_order_manager import (
                     DAILY_LIMIT,
                     add_today_reject,
-                    UpstoxOrderManager,
                     is_today_rejected,
                     validate_trade_amount,
                 )
@@ -2195,7 +2170,7 @@ def handle_source_table(
                     )
                     return
 
-                available_funds = UpstoxOrderManager().get_available_margin()
+                available_funds = get_order_manager_class("zerodha")().get_available_margin()
                 prompt_qty, prompt_order_value, used_today = validate_trade_amount(
                     source_table,
                     ltp,
@@ -2302,7 +2277,7 @@ def handle_source_table(
 
         order_result = trigger_order_execution("BUY", source_table, ltp, broker=broker, confirm_order=False)
         if not order_result.get("success"):
-            fail_reason = _failure_reason_from_order_result(order_result)
+            fail_reason = _failure_reason_from_order_result(order_result, broker=broker)
             fail_message = f"BUY {source_table} skipped: {fail_reason}."
             print(fail_message)
             inserted_id = insert_signal_row(
@@ -2345,10 +2320,10 @@ def handle_source_table(
         buy_qty = order_result.get("qty")
         if buy_qty is None:
             try:
-                from upstox_order_manager import PER_TRADE_VALUE as UPS_PCT_PER_TRADE_VALUE
+                from zerodha_order_manager import PER_TRADE_VALUE as ZERODHA_PER_TRADE_VALUE
             except Exception:
-                UPS_PCT_PER_TRADE_VALUE = 0.0
-            buy_qty = max(1, int(float(UPS_PCT_PER_TRADE_VALUE) // float(ltp))) if float(UPS_PCT_PER_TRADE_VALUE) > 0 else 1
+                ZERODHA_PER_TRADE_VALUE = 0.0
+            buy_qty = max(1, int(float(ZERODHA_PER_TRADE_VALUE) // float(ltp))) if float(ZERODHA_PER_TRADE_VALUE) > 0 else 1
         buy_product = order_result.get("product") or "D"
         buy_id = insert_signal_row(
             conn,
@@ -2440,7 +2415,8 @@ def main() -> None:
     print("\nStartup configuration summary")
     print("-" * 48)
     print(f"Interval: {getattr(args, 'interval', DEFAULT_INTERVAL_SECONDS)}s   Symbols: {symbols_display}")
-    print(f"Broker: {broker}")
+    print("Price feed: Upstox live websocket")
+    print(f"Order execution broker: {get_broker_display_name(broker)}")
     print(f"Confirm order: {getattr(args, 'confirmOrder', False)}")
     print(f"Telegram: {'ENABLED' if getattr(args, 'telegram', False) else 'DISABLED'}  token_sample={bot_sample} chat_sample={chat_sample}")
     print("BUY sizing: PER_TRADE_VALUE is the maximum order cap, with DAILY_LIMIT and available funds checks.")

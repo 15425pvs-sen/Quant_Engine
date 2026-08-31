@@ -1,3 +1,4 @@
+import argparse
 import json
 from pathlib import Path
 
@@ -30,17 +31,83 @@ def create_kite_client() -> KiteConnect:
     return kite
 
 
+def _lookup_path(payload, *path):
+    current = payload
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _extract_available_margin(payload) -> float | None:
+    if isinstance(payload, bool):
+        return None
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    if isinstance(payload, list):
+        for item in payload:
+            margin = _extract_available_margin(item)
+            if margin is not None:
+                return margin
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    for path in (
+        ("data", "equity", "net"),
+        ("data", "equity", "available", "live_balance"),
+        ("data", "equity", "available", "cash"),
+        ("data", "net"),
+        ("data", "available", "live_balance"),
+        ("data", "available", "cash"),
+        ("equity", "net"),
+        ("equity", "available", "live_balance"),
+        ("equity", "available", "cash"),
+        ("net",),
+        ("available", "live_balance"),
+        ("available", "cash"),
+    ):
+        value = _lookup_path(payload, *path)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                continue
+    return None
+
+
+def get_available_funds() -> float | None:
+    kite = create_kite_client()
+    for getter in (lambda: kite.margins(), lambda: kite.margins("equity")):
+        try:
+            payload = getter()
+        except Exception:
+            continue
+
+        margin = _extract_available_margin(payload)
+        if margin is not None:
+            return margin
+    return None
+
+
 def get_portfolio_details() -> dict:
     kite = create_kite_client()
 
     profile = kite.profile()
     holdings = kite.holdings()
     positions = kite.positions()
+    available_funds = get_available_funds()
 
     portfolio = {
         "profile": profile,
         "holdings": holdings,
         "positions": positions,
+        "available_funds": available_funds,
     }
     return portfolio
 
@@ -80,23 +147,46 @@ def format_holdings(holdings: list[dict]) -> None:
 
     total_value, total_pnl, total_qty = summarize_holdings(holdings)
     print(f"Total Holdings Count: {total_qty}")
-    print(f"Total Portfolio Value: ₹{total_value:,.2f}")
-    print(f"Total P/L: ₹{total_pnl:,.2f}")
+    print(f"Total Portfolio Value: Rs. {total_value:,.2f}")
+    print(f"Total P/L: Rs. {total_pnl:,.2f}")
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Show Zerodha portfolio data and available funds."
+    )
+    parser.add_argument(
+        "--available-funds",
+        action="store_true",
+        default=True,
+        help="Display available Zerodha funds in the portfolio summary.",
+    )
+    parser.add_argument(
+        "--no-available-funds",
+        dest="available_funds",
+        action="store_false",
+        help="Hide available Zerodha funds in the portfolio summary.",
+    )
+    args = parser.parse_args()
+
     try:
         portfolio = get_portfolio_details()
 
         profile = portfolio.get("profile", {})
         holdings = portfolio.get("holdings", [])
+        available_funds = portfolio.get("available_funds")
         total_value, total_pnl, _ = summarize_holdings(holdings)
 
         print("==== Zerodha Portfolio Summary ====")
         print(f"User: {profile.get('user_name') or profile.get('user_id') or 'N/A'}")
         print(f"Account: {profile.get('account') or 'N/A'}")
-        print(f"Total Portfolio Value: ₹{total_value:,.2f}")
-        print(f"Total P/L: ₹{total_pnl:,.2f}")
+        if args.available_funds:
+            if available_funds is None:
+                print("Available Funds: unavailable")
+            else:
+                print(f"Available Funds: Rs. {available_funds:,.2f}")
+        print(f"Total Portfolio Value: Rs. {total_value:,.2f}")
+        print(f"Total P/L: Rs. {total_pnl:,.2f}")
 
         net_positions = portfolio["positions"].get("net", [])
         if net_positions:

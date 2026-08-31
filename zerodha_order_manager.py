@@ -45,11 +45,12 @@ TOKEN_FILE = Path(__file__).with_name("zerodha_tokens.json")
 DAILY_USAGE_FILE = Path(__file__).resolve().parent / "zerodha_daily_usage.json"
 
 PER_TRADE_VALUE = 4000.0
-DAILY_LIMIT = 20000.0
+DAILY_LIMIT = 25000.0
 DEFAULT_EXCHANGE = "NSE"
 DEFAULT_PRODUCT = "CNC"
 DEFAULT_ORDER_TYPE = "MARKET"
 DEFAULT_VALIDITY = "DAY"
+DEFAULT_MARKET_PROTECTION = float(os.getenv("ZERODHA_MARKET_PROTECTION", "1.0"))
 
 
 def _today_key() -> str:
@@ -122,6 +123,8 @@ def load_tokens() -> dict[str, Any]:
 
 
 def _extract_numeric_margin(payload: Any) -> float | None:
+    if isinstance(payload, bool):
+        return None
     if isinstance(payload, (int, float)):
         return float(payload)
     if isinstance(payload, list):
@@ -164,6 +167,17 @@ def _extract_numeric_margin(payload: Any) -> float | None:
         if nested is not None:
             return nested
     return None
+
+
+def _lookup_path(payload: Any, *path: str) -> Any:
+    current = payload
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        if key not in current:
+            return None
+        current = current.get(key)
+    return current
 
 
 def get_today_usage() -> tuple[str, float]:
@@ -612,6 +626,24 @@ class ZerodhaOrderManager:
                 payload = getter()
             except Exception:
                 continue
+            for path in (
+                ("data", "equity", "net"),
+                ("data", "equity", "available", "live_balance"),
+                ("data", "equity", "available", "cash"),
+                ("data", "net"),
+                ("data", "available", "live_balance"),
+                ("data", "available", "cash"),
+                ("equity", "net"),
+                ("equity", "available", "live_balance"),
+                ("equity", "available", "cash"),
+                ("net",),
+                ("available", "live_balance"),
+                ("available", "cash"),
+            ):
+                value = _lookup_path(payload, *path)
+                margin = _extract_numeric_margin(value)
+                if margin is not None:
+                    return margin
             margin = _extract_numeric_margin(payload)
             if margin is not None:
                 return margin
@@ -724,11 +756,11 @@ class ZerodhaOrderManager:
             payload["price"] = float(price)
         if order_type in {"SL", "SL-M"} and float(trigger_price or 0.0) > 0:
             payload["trigger_price"] = float(trigger_price)
-        if market_protection is not None:
-            payload["market_protection"] = float(market_protection)
-        if autoslice is not None:
-            payload["autoslice"] = bool(autoslice)
-
+        effective_market_protection = market_protection
+        if order_type == "MARKET" and effective_market_protection is None:
+            effective_market_protection = DEFAULT_MARKET_PROTECTION
+        if effective_market_protection is not None:
+            payload["market_protection"] = float(effective_market_protection)
         if dry_run or not self.allow_live_orders:
             return {
                 "status": "DRY_RUN",
@@ -736,7 +768,17 @@ class ZerodhaOrderManager:
             }
 
         try:
-            order_id = self.kite.place_order(**payload)
+            if autoslice:
+                response = self.kite.place_autoslice_order(**payload)
+                order_id = response.get("order_id") if isinstance(response, dict) else response
+                return {
+                    "status": "SUBMITTED",
+                    "order_id": order_id,
+                    "response": response,
+                    "payload": payload,
+                }
+            else:
+                order_id = self.kite.place_order(**payload)
         except Exception as exc:  # pragma: no cover - depends on broker/API state
             raise ZerodhaOrderError(f"Failed to place Zerodha order: {exc}") from exc
 
@@ -798,6 +840,7 @@ def main() -> None:
         print(f"Available Zerodha margin: {available_margin:.2f}")
     else:
         print("Available Zerodha margin: unavailable")
+    print(f"Active MARKET protection: {DEFAULT_MARKET_PROTECTION:.2f}")
 
     if args.side == "BUY":
         if is_today_rejected(args.symbol):
