@@ -24,6 +24,8 @@ Live prices continue to come from Upstox. BUY/SELL order placement goes to Zerod
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import sqlite3
 import subprocess
@@ -50,6 +52,7 @@ except ImportError as exc:
     ) from exc
 
 DB_NAME = Path(__file__).resolve().parent / "quant_historic_data.db"
+ZERODHA_TRADE_LIMITS_FILE = Path(__file__).resolve().parent / "zerodha_trade_limits.json"
 HEATMAP_TABLE = "rsi_heatmap_data_for_trading"
 SIGNAL_LOG_TABLE = "rsi_live_signal_log_trading"
 ALL_SIGNAL_LOG_TABLE = "rsi_live_signal_log_trading_all_signals"
@@ -60,8 +63,8 @@ MARKET_OPEN_HOUR = 9
 MARKET_OPEN_MINUTE = 20
 MARKET_CLOSE_HOUR = 15
 MARKET_CLOSE_MINUTE = 30
-SELL_AMC_CHARGE = 19.0
 DEFAULT_BASKET_SELL_RSI_THRESHOLD = 60.0
+DEFAULT_BASKET_BUY_PRICE_DISPERSION_PCT = 2.0
 DEFAULT_ORDER_BROKER = "zerodha"
 ORDER_BROKER_CHOICES = {"zerodha"}
 
@@ -103,6 +106,152 @@ def _parse_signal_date(value: object) -> datetime | None:
         return datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _is_same_calendar_day(left: object, right: object) -> bool:
+    left_dt = _parse_signal_date(left)
+    right_dt = _parse_signal_date(right)
+    if left_dt is None or right_dt is None:
+        return False
+    return left_dt.date() == right_dt.date()
+
+
+def _load_zerodha_trade_limits() -> tuple[float, float]:
+    default_per_trade_value = 15000.0
+    default_daily_limit = 60000.0
+    if not ZERODHA_TRADE_LIMITS_FILE.exists():
+        return default_per_trade_value, default_daily_limit
+
+    try:
+        with ZERODHA_TRADE_LIMITS_FILE.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return default_per_trade_value, default_daily_limit
+
+    if not isinstance(data, dict):
+        return default_per_trade_value, default_daily_limit
+
+    try:
+        per_trade_value = float(data.get("PER_TRADE_VALUE", default_per_trade_value))
+    except (TypeError, ValueError):
+        per_trade_value = default_per_trade_value
+    try:
+        daily_limit = float(data.get("DAILY_LIMIT", default_daily_limit))
+    except (TypeError, ValueError):
+        daily_limit = default_daily_limit
+
+    if per_trade_value <= 0:
+        per_trade_value = default_per_trade_value
+    if daily_limit <= 0:
+        daily_limit = default_daily_limit
+    return per_trade_value, daily_limit
+
+
+def _zerodha_product_key(product: str | None) -> str:
+    return str(product or "").strip().upper()
+
+
+def estimate_zerodha_order_cost_breakdown(
+    order_value: float,
+    qty: int,
+    product: str | None,
+    side: str,
+    same_day: bool = False,
+) -> dict[str, float]:
+    trade_value = max(0.0, float(order_value))
+    qty = max(0, int(qty))
+    product_key = _zerodha_product_key(product)
+    side_key = str(side or "").strip().upper()
+
+    breakdown = {
+        "brokerage": 0.0,
+        "stt": 0.0,
+        "transaction_charges": 0.0,
+        "sebi_charges": 0.0,
+        "gst": 0.0,
+        "stamp_duty": 0.0,
+        "dp_charges": 0.0,
+        "total": 0.0,
+    }
+
+    if trade_value <= 0 or qty <= 0:
+        return breakdown
+
+    is_intraday_equivalent = product_key == "I" or bool(same_day)
+    dp_charges = 0.0
+
+    if is_intraday_equivalent:
+        brokerage = min(20.0, trade_value * 0.0003)
+        stt = trade_value * (0.00025 if side_key == "SELL" else 0.0)
+        transaction_charges = trade_value * 0.0000307
+        sebi_charges = trade_value * 0.000001
+        gst = 0.18 * (brokerage + transaction_charges + sebi_charges)
+        stamp_duty = trade_value * (0.00003 if side_key == "BUY" else 0.0)
+        total = brokerage + stt + transaction_charges + sebi_charges + gst + stamp_duty
+    else:
+        # Delivery: brokerage is zero, stamp duty applies on buy side, and DP charges
+        # apply on the sell side per order.
+        brokerage = 0.0
+        stt = trade_value * 0.001
+        transaction_charges = trade_value * 0.0000307
+        sebi_charges = trade_value * 0.000001
+        gst = 0.18 * (brokerage + transaction_charges + sebi_charges)
+        stamp_duty = trade_value * (0.00015 if side_key == "BUY" else 0.0)
+        dp_charges = 15.34 if side_key == "SELL" else 0.0
+        total = brokerage + stt + transaction_charges + sebi_charges + gst + stamp_duty + dp_charges
+
+    breakdown.update(
+        {
+            "brokerage": round(brokerage, 2),
+            "stt": round(stt, 2),
+            "transaction_charges": round(transaction_charges, 2),
+            "sebi_charges": round(sebi_charges, 2),
+            "gst": round(gst, 2),
+            "stamp_duty": round(stamp_duty, 2),
+            "dp_charges": round(dp_charges if product_key != "I" else 0.0, 2),
+            "total": round(total, 2),
+        }
+    )
+    return breakdown
+
+
+def estimate_zerodha_sell_cost(order_value: float, qty: int, product: str | None, same_day: bool = False) -> float:
+    return round(estimate_zerodha_sell_cost_breakdown(order_value, qty, product, same_day=same_day)["total"], 2)
+
+
+def estimate_zerodha_buy_cost(order_value: float, qty: int, product: str | None, same_day: bool = False) -> float:
+    return round(estimate_zerodha_buy_cost_breakdown(order_value, qty, product, same_day=same_day)["total"], 2)
+
+
+def estimate_zerodha_sell_cost_breakdown(
+    order_value: float,
+    qty: int,
+    product: str | None,
+    same_day: bool = False,
+) -> dict[str, float]:
+    return estimate_zerodha_order_cost_breakdown(order_value, qty, product, side="SELL", same_day=same_day)
+
+
+def estimate_zerodha_buy_cost_breakdown(
+    order_value: float,
+    qty: int,
+    product: str | None,
+    same_day: bool = False,
+) -> dict[str, float]:
+    return estimate_zerodha_order_cost_breakdown(order_value, qty, product, side="BUY", same_day=same_day)
+
+
+def format_zerodha_sell_cost_breakdown(breakdown: dict[str, float]) -> str:
+    return (
+        f"brokerage={breakdown.get('brokerage', 0.0):.2f}, "
+        f"stt={breakdown.get('stt', 0.0):.2f}, "
+        f"txn={breakdown.get('transaction_charges', 0.0):.2f}, "
+        f"sebi={breakdown.get('sebi_charges', 0.0):.2f}, "
+        f"gst={breakdown.get('gst', 0.0):.2f}, "
+        f"stamp={breakdown.get('stamp_duty', 0.0):.2f}, "
+        f"dp={breakdown.get('dp_charges', 0.0):.2f}, "
+        f"total={breakdown.get('total', 0.0):.2f}"
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -169,6 +318,16 @@ def parse_args() -> argparse.Namespace:
         "--confirmOrder",
         action="store_true",
         help="Prompt for Y/N before placing each broker order.",
+    )
+    parser.add_argument(
+        "--confirmOrderTelegram",
+        action="store_true",
+        help="Request order approval through Telegram instead of the local terminal prompt.",
+    )
+    parser.add_argument(
+        "--telegramConfirmTest",
+        action="store_true",
+        help="Send a Telegram approval test message and wait for YES/NO reply before exiting.",
     )
     parser.add_argument(
         "--broker",
@@ -279,6 +438,7 @@ def ensure_signal_log_table(conn: sqlite3.Connection) -> None:
             ltp               REAL NOT NULL,
             qty               INTEGER,
             product           TEXT,
+            net_pnl           REAL,
             signal_date       TEXT NOT NULL,
             signal_timestamp  TEXT NOT NULL,
             notes             TEXT,
@@ -303,6 +463,10 @@ def ensure_signal_log_table(conn: sqlite3.Connection) -> None:
         conn.execute(
             f"ALTER TABLE {quote_identifier(SIGNAL_LOG_TABLE)} ADD COLUMN product TEXT"
         )
+    if "net_pnl" not in existing_cols:
+        conn.execute(
+            f"ALTER TABLE {quote_identifier(SIGNAL_LOG_TABLE)} ADD COLUMN net_pnl REAL"
+        )
     if "basket_buy_ids" not in existing_cols:
         conn.execute(
             f"ALTER TABLE {quote_identifier(SIGNAL_LOG_TABLE)} ADD COLUMN basket_buy_ids TEXT"
@@ -320,6 +484,7 @@ def ensure_signal_log_table(conn: sqlite3.Connection) -> None:
             ltp               REAL NOT NULL,
             qty               INTEGER,
             product           TEXT,
+            net_pnl           REAL,
             signal_date       TEXT NOT NULL,
             signal_timestamp  TEXT NOT NULL,
             notes             TEXT,
@@ -341,6 +506,7 @@ def ensure_signal_log_table(conn: sqlite3.Connection) -> None:
     for column_name, column_type in (
         ("qty", "INTEGER"),
         ("product", "TEXT"),
+        ("net_pnl", "REAL"),
         ("basket_buy_ids", "TEXT"),
         ("order_status", "TEXT"),
         ("order_reason", "TEXT"),
@@ -816,6 +982,50 @@ def group_open_basket_buy_rows_by_product(
     return grouped, excluded_today
 
 
+def split_basket_buy_rows_by_dispersion(
+    basket_buy_rows: list[tuple[int, int, int, float, int, str | None, str | None]],
+    max_dispersion_pct: float = DEFAULT_BASKET_BUY_PRICE_DISPERSION_PCT,
+) -> list[list[tuple[int, int, int, float, int, str | None, str | None]]]:
+    if len(basket_buy_rows) < 2:
+        return []
+
+    rows = sorted(basket_buy_rows, key=lambda row: float(row[3]))
+    clusters: list[list[tuple[int, int, int, float, int, str | None, str | None]]] = []
+    current_cluster: list[tuple[int, int, int, float, int, str | None, str | None]] = []
+    cluster_min = 0.0
+    cluster_max = 0.0
+
+    for row in rows:
+        buy_ltp = float(row[3])
+        if buy_ltp <= 0:
+            continue
+        if not current_cluster:
+            current_cluster = [row]
+            cluster_min = buy_ltp
+            cluster_max = buy_ltp
+            continue
+
+        prospective_min = min(cluster_min, buy_ltp)
+        prospective_max = max(cluster_max, buy_ltp)
+        prospective_dispersion_pct = ((prospective_max - prospective_min) / prospective_min) * 100.0 if prospective_min > 0 else 0.0
+        if prospective_dispersion_pct <= float(max_dispersion_pct):
+            current_cluster.append(row)
+            cluster_min = prospective_min
+            cluster_max = prospective_max
+            continue
+
+        if len(current_cluster) >= 2:
+            clusters.append(current_cluster)
+        current_cluster = [row]
+        cluster_min = buy_ltp
+        cluster_max = buy_ltp
+
+    if len(current_cluster) >= 2:
+        clusters.append(current_cluster)
+
+    return clusters
+
+
 def has_buy_entry_rsi(conn: sqlite3.Connection, source_table: str, entry_rsi: int) -> bool:
     row = conn.execute(
         f"""
@@ -909,6 +1119,7 @@ def attempt_basket_sell(
     telegram_chat_id: str | None,
     broker: str,
     confirm_order: bool,
+    confirm_order_telegram: bool,
     dry_run: bool,
 ) -> bool:
     if len(basket_buy_rows) < 2 or float(current_rsi) < float(DEFAULT_BASKET_SELL_RSI_THRESHOLD):
@@ -924,16 +1135,29 @@ def attempt_basket_sell(
     basket_sell_value = float(ltp) * float(basket_qty)
     basket_pnl = round(basket_sell_value - basket_cost, 2)
     basket_pnl_pct = round(((float(ltp) - float(basket_avg_buy)) / float(basket_avg_buy)) * 100.0, 4) if basket_avg_buy else 0.0
+    basket_buy_prices = [float(row[3]) for row in basket_buy_rows if float(row[3]) > 0]
+    basket_buy_price_min = min(basket_buy_prices) if basket_buy_prices else 0.0
+    basket_buy_price_max = max(basket_buy_prices) if basket_buy_prices else 0.0
+    basket_buy_price_dispersion_pct = (
+        ((basket_buy_price_max - basket_buy_price_min) / basket_buy_price_min) * 100.0
+        if basket_buy_price_min > 0
+        else 0.0
+    )
     basket_buy_ids_text = ",".join(str(buy_id) for buy_id in basket_buy_ids)
     basket_detail_text = "; ".join(
         f"id={buy_id} entry={entry_rsi} exit={exit_rsi} buy_ltp={buy_ltp:.2f} qty={qty} date={buy_date}"
         for buy_id, entry_rsi, exit_rsi, buy_ltp, qty, _product, buy_date in basket_buy_rows
+    )
+    basket_same_day = bool(signal_date) and all(
+        _is_same_calendar_day(buy_date, signal_date)
+        for _buy_id, _entry_rsi, _exit_rsi, _buy_ltp, _qty, _product, buy_date in basket_buy_rows
     )
     excluded_today_text = ",".join(str(buy_id) for buy_id in excluded_today_buy_ids) if excluded_today_buy_ids else "none"
     basket_notes = (
         f"BASKET SELL | buy_ids=[{basket_buy_ids_text}] | avg_buy={basket_avg_buy:.2f} | "
         f"qty={basket_qty} | buy_cost={basket_cost:.2f} | sell_value={basket_sell_value:.2f} | "
         f"PnL={basket_pnl:.2f} ({basket_pnl_pct:.4f}%) | RSI={current_rsi:.2f} | "
+        f"dispersion={basket_buy_price_dispersion_pct:.4f}% | "
         f"details={basket_detail_text} | excluded_today_buy_ids={excluded_today_text}"
     )
 
@@ -951,10 +1175,38 @@ def attempt_basket_sell(
         )
         return False
 
-    if basket_pnl <= SELL_AMC_CHARGE:
+    estimated_sell_breakdown = estimate_zerodha_sell_cost_breakdown(
+        basket_sell_value,
+        basket_qty,
+        basket_buy_rows[0][5],
+        same_day=basket_same_day,
+    )
+    estimated_sell_cost = float(estimated_sell_breakdown["total"])
+    estimated_buy_cost_total = round(
+        sum(
+            float(
+                estimate_zerodha_buy_cost_breakdown(
+                    float(buy_ltp) * int(qty),
+                    int(qty),
+                    product,
+                    same_day=_is_same_calendar_day(buy_date, signal_date),
+                )["total"]
+            )
+            for _buy_id, _entry_rsi, _exit_rsi, buy_ltp, qty, product, buy_date in basket_buy_rows
+        ),
+        2,
+    )
+    estimated_net_pnl = round(basket_pnl - estimated_buy_cost_total - estimated_sell_cost, 2)
+    if estimated_net_pnl <= 0:
         print(
             f"Skipping basket SELL {source_table}: "
-            f"PnL={basket_pnl:.2f} <= AMC charge {SELL_AMC_CHARGE:.2f}"
+            f"estimated net pnl={estimated_net_pnl:.2f} after charges is not positive."
+        )
+        return False
+    if basket_pnl <= estimated_sell_cost:
+        print(
+            f"Skipping basket SELL {source_table}: "
+            f"PnL={basket_pnl:.2f} <= estimated Zerodha sell cost {estimated_sell_cost:.2f}"
         )
         return False
 
@@ -963,16 +1215,28 @@ def attempt_basket_sell(
         f"SELL {source_table} | basket_buy_ids=[{basket_buy_ids_text}] | "
         f"avg_buy={basket_avg_buy:.2f} | qty={basket_qty} | "
         f"SELL LTP {ltp:.2f} | PnL {basket_pnl:.2f} ({basket_pnl_pct:.4f}%) | "
+        f"est_cost {estimated_sell_cost:.2f} | est_net_pnl {estimated_net_pnl:.2f} | "
+        f"cost_breakdown [{format_zerodha_sell_cost_breakdown(estimated_sell_breakdown)}] | "
         f"RSI {current_rsi:.2f} | excluded_today_buy_ids={excluded_today_text}"
     )
     print(basket_message)
 
-    if confirm_order:
+    if confirm_order or confirm_order_telegram:
         prompt = (
             f"Confirm BASKET SELL {source_table} | qty={basket_qty} | "
-            f"avg_buy={basket_avg_buy:.2f} | SELL LTP={ltp:.2f} | PnL={basket_pnl:.2f} ? [Y/N]: "
+            f"avg_buy={basket_avg_buy:.2f} | SELL LTP={ltp:.2f} | "
+            f"PnL={basket_pnl:.2f} | est_cost={estimated_sell_cost:.2f} | "
+            f"est_net_pnl={estimated_net_pnl:.2f} | "
+            f"breakdown=[{format_zerodha_sell_cost_breakdown(estimated_sell_breakdown)}] ? [Y/N]: "
         )
-        if not _prompt_order_confirmation(prompt):
+        approval_key = _make_approval_key("BST", source_table, basket_qty, signal_timestamp, basket_buy_ids_text)
+        if not _resolve_order_confirmation(
+            prompt,
+            confirm_order_telegram,
+            approval_key,
+            telegram_bot_token,
+            telegram_chat_id,
+        ):
             fail_reason = "user declined basket order confirmation"
             print(f"BASKET SELL {source_table} skipped: {fail_reason}.")
             inserted_id = insert_signal_row(
@@ -992,6 +1256,7 @@ def attempt_basket_sell(
                     "notes": f"SKIPPED | {fail_reason} | {basket_notes}",
                     "position_state": SELL_CONFIRMED_STATE,
                     "buy_signal_id": None,
+                    "net_pnl": estimated_net_pnl,
                     "trigger_exit_rsi": int(basket_buy_rows[0][2]),
                     "action_timestamp": signal_timestamp,
                     "closed_by_signal_id": None,
@@ -1033,6 +1298,7 @@ def attempt_basket_sell(
                 "notes": f"DRY_RUN | {basket_notes}",
                 "position_state": SELL_CONFIRMED_STATE,
                 "buy_signal_id": None,
+                "net_pnl": estimated_net_pnl,
                 "trigger_exit_rsi": int(basket_buy_rows[0][2]),
                 "action_timestamp": signal_timestamp,
                 "closed_by_signal_id": None,
@@ -1079,6 +1345,7 @@ def attempt_basket_sell(
                 "notes": f"SKIPPED | {fail_reason} | {basket_notes}",
                 "position_state": SELL_CONFIRMED_STATE,
                 "buy_signal_id": None,
+                "net_pnl": estimated_net_pnl,
                 "trigger_exit_rsi": int(basket_buy_rows[0][2]),
                 "action_timestamp": signal_timestamp,
                 "closed_by_signal_id": None,
@@ -1109,6 +1376,30 @@ def attempt_basket_sell(
     )
     resolved_qty = int(order_result.get("qty") or basket_qty)
     resolved_product = str(order_result.get("product") or basket_buy_rows[0][5] or "").strip() or None
+    sell_breakdown = estimate_zerodha_sell_cost_breakdown(
+        float(ltp) * float(resolved_qty),
+        resolved_qty,
+        resolved_product,
+        same_day=basket_same_day,
+    )
+    sell_cost_total = float(sell_breakdown["total"])
+    buy_cost_total = round(
+        sum(
+            float(
+                estimate_zerodha_buy_cost_breakdown(
+                    float(buy_ltp) * int(qty),
+                    int(qty),
+                    product,
+                    same_day=_is_same_calendar_day(buy_date, signal_date),
+                )["total"]
+            )
+            for _buy_id, _entry_rsi, _exit_rsi, buy_ltp, qty, product, buy_date in basket_buy_rows
+        ),
+        2,
+    )
+    basket_sell_value = float(ltp) * float(resolved_qty)
+    basket_gross_pnl = round(basket_sell_value - (basket_avg_buy * float(resolved_qty)), 2)
+    basket_net_pnl = round(basket_gross_pnl - buy_cost_total - sell_cost_total, 2)
     basket_sell_id = insert_signal_row(
         conn,
         {
@@ -1126,6 +1417,7 @@ def attempt_basket_sell(
             "notes": basket_notes,
             "position_state": SELL_CONFIRMED_STATE,
             "buy_signal_id": None,
+            "net_pnl": basket_net_pnl,
             "trigger_exit_rsi": int(basket_buy_rows[0][2]),
             "action_timestamp": signal_timestamp,
             "closed_by_signal_id": None,
@@ -1173,96 +1465,311 @@ def get_matching_exit_bucket(
     return sorted(matches, key=lambda item: item[1])[0]
 
 
-def get_trade_results(conn: sqlite3.Connection) -> pd.DataFrame:
+def _parse_basket_buy_ids_text(value: object) -> list[int]:
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+    ids: list[int] = []
+    for part in raw.split(","):
+        try:
+            buy_id = int(part.strip())
+        except (TypeError, ValueError):
+            continue
+        if buy_id > 0:
+            ids.append(buy_id)
+    return ids
+
+
+def _load_signal_rows_by_ids(
+    conn: sqlite3.Connection,
+    ids: list[int],
+    signal_type: str = "BUY",
+) -> pd.DataFrame:
+    cleaned_ids = [int(signal_id) for signal_id in ids if int(signal_id) > 0]
+    if not cleaned_ids:
+        return pd.DataFrame(columns=["id", "ltp", "qty", "product"])
+
+    placeholders = ",".join("?" for _ in cleaned_ids)
+    query = f"""
+        SELECT id, ltp, qty, product, signal_timestamp
+        FROM {quote_identifier(SIGNAL_LOG_TABLE)}
+        WHERE id IN ({placeholders})
+          AND signal_type = ?
+        ORDER BY id ASC
+    """
+    return pd.read_sql(query, conn, params=(*cleaned_ids, signal_type))
+
+
+def _estimate_order_cost_total_for_rows(
+    rows: pd.DataFrame,
+    side: str,
+    reference_timestamp: object | None = None,
+) -> float:
+    if rows.empty:
+        return 0.0
+
+    total = 0.0
+    for _, row in rows.iterrows():
+        ltp = pd.to_numeric(pd.Series([row.get("ltp")]), errors="coerce").iloc[0]
+        qty = pd.to_numeric(pd.Series([row.get("qty")]), errors="coerce").iloc[0]
+        if pd.isna(ltp) or pd.isna(qty):
+            continue
+        order_value = float(ltp) * float(qty)
+        product = row.get("product")
+        same_day = False
+        if reference_timestamp is not None and pd.notna(reference_timestamp):
+            same_day = _is_same_calendar_day(row.get("signal_timestamp"), reference_timestamp)
+        if str(side).strip().upper() == "BUY":
+            total += float(estimate_zerodha_buy_cost_breakdown(order_value, int(qty), product, same_day=same_day)["total"])
+        else:
+            total += float(estimate_zerodha_sell_cost_breakdown(order_value, int(qty), product, same_day=same_day)["total"])
+    return round(total, 2)
+
+
+def get_trade_result_detail(conn: sqlite3.Connection) -> pd.DataFrame:
     query = f"""
         SELECT
             source_table,
             id,
             buy_signal_id,
+            basket_buy_ids,
             ltp,
             signal_timestamp,
             qty,
+            product,
+            net_pnl,
             position_state
         FROM {quote_identifier(SIGNAL_LOG_TABLE)}
         WHERE signal_type = 'SELL'
-          AND buy_signal_id IS NOT NULL
+          AND (buy_signal_id IS NOT NULL OR COALESCE(basket_buy_ids, '') <> '')
           AND position_state IN ('CONFIRMED', 'CLOSED')
         ORDER BY source_table ASC, id ASC
         """
     sell_rows = pd.read_sql(query, conn)
     if sell_rows.empty:
-        return pd.DataFrame(columns=["source_table", "trades", "entry_price", "exit_price", "pnl_pct", "pnl_abs"])
+        return pd.DataFrame(
+            columns=[
+                "source_table",
+                "sell_id",
+                "buy_ids",
+                "trade_type",
+                "buy_qty",
+                "sell_qty",
+                "buy_cost",
+                "buy_cost_total",
+                "sell_value",
+                "sell_cost_total",
+                "gross_pnl_abs",
+                "gross_pnl_pct",
+                "net_pnl_abs",
+                "net_pnl_pct",
+                "signal_timestamp",
+            ]
+        )
 
     results: list[dict[str, object]] = []
     for _, row in sell_rows.iterrows():
-        buy_row = pd.read_sql(
-            f"""
-            SELECT ltp, signal_timestamp
-            FROM {quote_identifier(SIGNAL_LOG_TABLE)}
-            WHERE id = ?
-              AND signal_type = 'BUY'
-            """,
-            conn,
-            params=(int(row["buy_signal_id"]),),
+        buy_ids = []
+        buy_signal_id = int(row.get("buy_signal_id") or 0)
+        if buy_signal_id > 0:
+            buy_ids = [buy_signal_id]
+        else:
+            buy_ids = _parse_basket_buy_ids_text(row.get("basket_buy_ids"))
+
+        buy_rows = _load_signal_rows_by_ids(conn, buy_ids, signal_type="BUY")
+        if buy_rows.empty:
+            continue
+
+        buy_rows = buy_rows.copy()
+        buy_rows["ltp"] = pd.to_numeric(buy_rows["ltp"], errors="coerce")
+        buy_rows["qty"] = pd.to_numeric(buy_rows["qty"], errors="coerce")
+        buy_rows = buy_rows.dropna(subset=["ltp", "qty"])
+        if buy_rows.empty:
+            continue
+
+        buy_qty = int(buy_rows["qty"].sum())
+        buy_cost = float((buy_rows["ltp"] * buy_rows["qty"]).sum())
+        if buy_qty <= 0 or buy_cost <= 0:
+            continue
+
+        sell_qty = int(row.get("qty") or buy_qty)
+        sell_price = float(row.get("ltp") or 0.0)
+        sell_value = sell_price * float(sell_qty)
+        sell_timestamp = row.get("signal_timestamp")
+        gross_pnl_abs = round(sell_value - buy_cost, 2)
+        gross_pnl_pct = round((gross_pnl_abs / buy_cost) * 100.0, 2) if buy_cost else 0.0
+
+        sell_product = str(row.get("product") or buy_rows.iloc[0].get("product") or "").strip() or None
+        buy_cost_total = _estimate_order_cost_total_for_rows(buy_rows, side="BUY", reference_timestamp=sell_timestamp)
+        sell_same_day = pd.notna(sell_timestamp) and all(
+            _is_same_calendar_day(buy_row_ts, sell_timestamp) for buy_row_ts in buy_rows["signal_timestamp"].tolist()
         )
-        if buy_row.empty:
-            continue
+        sell_cost_total = float(
+            estimate_zerodha_sell_cost_breakdown(sell_value, sell_qty, sell_product, same_day=sell_same_day)["total"]
+        )
+        net_pnl_abs = round(gross_pnl_abs - buy_cost_total - sell_cost_total, 2)
+        net_pnl_pct = round((net_pnl_abs / buy_cost) * 100.0, 2) if buy_cost else 0.0
 
-        entry_price = float(buy_row.iloc[0]["ltp"])
-        exit_price = float(row["ltp"])
-        qty = int(row["qty"] or 0)
-        if entry_price <= 0:
-            continue
-
-        pnl_pct = ((exit_price - entry_price) / entry_price) * 100.0
-        pnl_abs = (exit_price - entry_price) * qty
         results.append(
             {
                 "source_table": str(row["source_table"]).strip().upper(),
-                "entry_price": entry_price,
-                "exit_price": exit_price,
-                "pnl_pct": round(float(pnl_pct), 2),
-                "pnl_abs": round(float(pnl_abs), 2),
+                "sell_id": int(row["id"]),
+                "buy_ids": ",".join(str(item) for item in buy_ids),
+                "trade_type": "BASKET" if len(buy_ids) > 1 else "SINGLE",
+                "buy_qty": buy_qty,
+                "sell_qty": sell_qty,
+                "buy_cost": round(buy_cost, 2),
+                "buy_cost_total": round(buy_cost_total, 2),
+                "sell_value": round(sell_value, 2),
+                "sell_cost_total": round(sell_cost_total, 2),
+                "gross_pnl_abs": gross_pnl_abs,
+                "net_pnl_abs": net_pnl_abs,
+                "gross_pnl_pct": gross_pnl_pct,
+                "net_pnl_pct": net_pnl_pct,
+                "signal_timestamp": row.get("signal_timestamp"),
             }
         )
 
     if not results:
-        return pd.DataFrame(columns=["source_table", "trades", "entry_price", "exit_price", "pnl_pct", "pnl_abs"])
+        return pd.DataFrame(columns=[
+            "source_table",
+            "sell_id",
+            "buy_ids",
+            "trade_type",
+            "buy_qty",
+            "sell_qty",
+            "buy_cost",
+            "buy_cost_total",
+            "sell_value",
+            "sell_cost_total",
+            "gross_pnl_abs",
+            "gross_pnl_pct",
+            "net_pnl_abs",
+            "net_pnl_pct",
+            "signal_timestamp",
+        ])
 
     results_df = pd.DataFrame(results)
+    results_df["signal_timestamp"] = pd.to_datetime(results_df["signal_timestamp"], errors="coerce")
+    return results_df
+
+
+def get_trade_results(conn: sqlite3.Connection) -> pd.DataFrame:
+    detail_df = get_trade_result_detail(conn)
+    if detail_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "source_table",
+                "trades",
+                "gross_pnl_abs",
+                "net_pnl_abs",
+                "gross_pnl_pct",
+                "net_pnl_pct",
+                "buy_cost",
+                "sell_value",
+                "buy_cost_total",
+                "sell_cost_total",
+            ]
+        )
+
     summary = (
-        results_df.groupby("source_table", sort=True)
+        detail_df.groupby("source_table", sort=True)
         .agg(
-            trades=("pnl_pct", "size"),
-            entry_price=("entry_price", "mean"),
-            exit_price=("exit_price", "mean"),
-            pnl_pct=("pnl_pct", "mean"),
-            pnl_abs=("pnl_abs", "sum"),
+            trades=("sell_id", "count"),
+            buy_cost=("buy_cost", "sum"),
+            sell_value=("sell_value", "sum"),
+            buy_cost_total=("buy_cost_total", "sum"),
+            sell_cost_total=("sell_cost_total", "sum"),
+            gross_pnl_abs=("gross_pnl_abs", "sum"),
+            net_pnl_abs=("net_pnl_abs", "sum"),
         )
         .reset_index()
     )
-    summary = summary.sort_values(by=["pnl_pct", "source_table"], ascending=[False, True]).reset_index(drop=True)
+    summary["gross_pnl_pct"] = summary.apply(
+        lambda row: round((float(row["gross_pnl_abs"]) / float(row["buy_cost"])) * 100.0, 2) if float(row["buy_cost"]) else 0.0,
+        axis=1,
+    )
+    summary["net_pnl_pct"] = summary.apply(
+        lambda row: round((float(row["net_pnl_abs"]) / float(row["buy_cost"])) * 100.0, 2) if float(row["buy_cost"]) else 0.0,
+        axis=1,
+    )
+    summary = summary.sort_values(by=["net_pnl_pct", "source_table"], ascending=[False, True]).reset_index(drop=True)
     return summary
 
 
 def print_trade_results(conn: sqlite3.Connection) -> None:
-    results_df = get_trade_results(conn)
-    if results_df.empty:
+    detail_df = get_trade_result_detail(conn)
+    if detail_df.empty:
         print("No completed BUY/SELL trades found in the signal log.")
         return
 
+    summary_df = get_trade_results(conn)
+    print("\nTrade results detail")
+    print("-" * 120)
+    print(
+        detail_df[
+            [
+                "source_table",
+                "sell_id",
+                "trade_type",
+                "buy_ids",
+                "buy_qty",
+                "sell_qty",
+                "gross_pnl_abs",
+                "net_pnl_abs",
+                "signal_timestamp",
+            ]
+        ].to_string(index=False)
+    )
+
     print("\nTrade results summary")
-    print("-" * 60)
-    for _, row in results_df.iterrows():
+    print("-" * 120)
+    for _, row in summary_df.iterrows():
         print(
             f"{str(row['source_table']).upper():<12} trades={int(row['trades']):>2}  "
-            f"P&L={float(row['pnl_abs']):>10.2f}  P&L%={float(row['pnl_pct']):>8.2f}"
+            f"GROSS={float(row['gross_pnl_abs']):>10.2f}  "
+            f"NET={float(row['net_pnl_abs']):>10.2f}  "
+            f"NET%={float(row['net_pnl_pct']):>8.2f}"
         )
 
-    overall_pnl = round(float(results_df["pnl_pct"].mean()), 2)
-    overall_abs_pnl = round(float(results_df["pnl_abs"].sum()), 2)
-    print("-" * 60)
-    print(f"Overall P&L: {overall_abs_pnl:.2f} ({overall_pnl:.2f}%)")
+    overall_buy_cost = round(float(summary_df["buy_cost"].sum()), 2)
+    overall_gross_pnl = round(float(summary_df["gross_pnl_abs"].sum()), 2)
+    overall_net_pnl = round(float(summary_df["net_pnl_abs"].sum()), 2)
+    overall_gross_pct = round((overall_gross_pnl / overall_buy_cost) * 100.0, 2) if overall_buy_cost else 0.0
+    overall_net_pct = round((overall_net_pnl / overall_buy_cost) * 100.0, 2) if overall_buy_cost else 0.0
+    print("-" * 120)
+    print(f"Overall Trades: {int(summary_df['trades'].sum())}")
+    print(f"Overall Buy Cost: {overall_buy_cost:.2f}")
+    print(f"Overall Gross P&L: {overall_gross_pnl:.2f} ({overall_gross_pct:.2f}%)")
+    print(f"Overall Net P&L: {overall_net_pnl:.2f} ({overall_net_pct:.2f}%)")
+
+    open_buy_query = f"""
+        SELECT id, source_table, entry_rsi, exit_rsi, ltp, qty, product, signal_timestamp, position_state
+        FROM {quote_identifier(SIGNAL_LOG_TABLE)}
+        WHERE signal_type = 'BUY'
+          AND position_state = 'OPEN'
+        ORDER BY source_table ASC, id ASC
+    """
+    open_buy_rows = pd.read_sql(open_buy_query, conn)
+    print("\nOpen BUY positions")
+    print("-" * 120)
+    if open_buy_rows.empty:
+        print("None")
+    else:
+        print(
+            open_buy_rows[
+                [
+                    "id",
+                    "source_table",
+                    "entry_rsi",
+                    "exit_rsi",
+                    "ltp",
+                    "qty",
+                    "product",
+                    "signal_timestamp",
+                ]
+            ].to_string(index=False)
+        )
 
 
 def compute_wilder_rsi(close: pd.Series, period: int = 14) -> pd.Series:
@@ -1388,6 +1895,7 @@ def insert_signal_row(
                 ltp,
                 qty,
                 product,
+                net_pnl,
                 signal_date,
                 signal_timestamp,
                 notes,
@@ -1400,7 +1908,7 @@ def insert_signal_row(
                 order_status,
                 order_reason
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 row["source_table"],
@@ -1412,6 +1920,7 @@ def insert_signal_row(
                 row["ltp"],
                 row.get("qty"),
                 row.get("product"),
+                row.get("net_pnl"),
                 row["signal_date"],
                 row["signal_timestamp"],
                 row["notes"],
@@ -1439,6 +1948,7 @@ def insert_signal_row(
                 current_rsi,
                 ltp,
                 qty,
+                net_pnl,
                 signal_date,
                 signal_timestamp,
                 product,
@@ -1450,18 +1960,19 @@ def insert_signal_row(
                 closed_by_signal_id,
                 basket_buy_ids
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 row["source_table"],
                 row["signal_type"],
                 row["entry_rsi"],
-                    row["exit_rsi"],
-                    row["previous_rsi"],
-                    row["current_rsi"],
-                    row["ltp"],
-                    row.get("qty"),
-                    row["signal_date"],
+                row["exit_rsi"],
+                row["previous_rsi"],
+                row["current_rsi"],
+                row["ltp"],
+                row.get("qty"),
+                row.get("net_pnl"),
+                row["signal_date"],
                 row["signal_timestamp"],
                 row.get("product"),
                 row["notes"],
@@ -1475,6 +1986,27 @@ def insert_signal_row(
         )
     conn.commit()
     return int(cursor.lastrowid)
+
+
+def update_signal_execution_details_local(
+    conn: sqlite3.Connection,
+    signal_id: int,
+    qty: int,
+    product: str | None,
+) -> bool:
+    if signal_id <= 0:
+        return False
+
+    try:
+        cursor = conn.execute(
+            f"UPDATE {quote_identifier(SIGNAL_LOG_TABLE)} SET qty = ?, product = ? WHERE id = ?",
+            (int(qty), product, int(signal_id)),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    except sqlite3.Error as exc:
+        print(f"Warning: failed to update execution details for signal_id={signal_id}: {exc}")
+        return False
 
 
 def trigger_order_execution(
@@ -1691,6 +2223,163 @@ def _prompt_order_confirmation(message: str) -> bool:
         return False
 
 
+def _normalize_confirmation_text(value: str) -> str:
+    return " ".join(str(value or "").strip().upper().split())
+
+
+def _make_approval_key(prefix: str, *parts: object) -> str:
+    raw = "|".join(str(part or "") for part in parts)
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest().upper()[:6]
+    return f"{prefix}-{digest}"
+
+
+def _telegram_get_updates(token: str, offset: int | None = None) -> list[dict[str, object]]:
+    try:
+        import requests
+    except ImportError:
+        raise RuntimeError("Telegram confirmation requires the 'requests' package.")
+
+    params: dict[str, object] = {"timeout": 1, "limit": 100}
+    if offset is not None:
+        params["offset"] = offset
+
+    response = requests.get(
+        f"https://api.telegram.org/bot{token}/getUpdates",
+        params=params,
+        timeout=10,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        return []
+    result = payload.get("result", [])
+    if isinstance(result, list):
+        return [item for item in result if isinstance(item, dict)]
+    return []
+
+
+def _telegram_confirmation_reply(
+    token: str,
+    chat_id: str | None,
+    approval_key: str,
+    prompt_message: str,
+    timeout_seconds: int = 120,
+    poll_interval_seconds: float = 2.5,
+) -> bool:
+    chat = str(chat_id or os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+    if not token or not chat:
+        print("Telegram confirmation skipped: missing bot token or chat id.")
+        return False
+
+    approval_key = _normalize_confirmation_text(approval_key)
+    if not approval_key:
+        print("Telegram confirmation skipped: missing approval key.")
+        return False
+
+    approval_message = (
+        f"{prompt_message}\n\n"
+        f"Reply with <b>YES {approval_key}</b> to approve or <b>NO {approval_key}</b> to reject."
+    )
+    if not send_telegram_message(approval_message, bot_token=token, chat_id=chat):
+        print("Telegram confirmation request could not be sent.")
+        return False
+
+    pending_offset: int | None = None
+    try:
+        latest_updates = _telegram_get_updates(token, offset=None)
+        if latest_updates:
+            pending_offset = int(latest_updates[-1].get("update_id", 0)) + 1
+    except Exception:
+        pending_offset = None
+
+    deadline = time.time() + max(5, int(timeout_seconds))
+    approval_yes = {f"YES {approval_key}", f"Y {approval_key}", f"APPROVE {approval_key}"}
+    approval_no = {f"NO {approval_key}", f"N {approval_key}", f"REJECT {approval_key}"}
+
+    while time.time() < deadline:
+        try:
+            updates = _telegram_get_updates(token, offset=pending_offset)
+        except Exception as exc:
+            print(f"Telegram confirmation poll failed: {exc}")
+            time.sleep(poll_interval_seconds)
+            continue
+
+        for update in updates:
+            update_id = update.get("update_id")
+            try:
+                if update_id is not None:
+                    pending_offset = max(int(update_id) + 1, pending_offset or 0)
+            except Exception:
+                pass
+
+            message = update.get("message")
+            if not isinstance(message, dict):
+                message = update.get("edited_message")
+            if not isinstance(message, dict):
+                continue
+
+            chat = message.get("chat")
+            if not isinstance(chat, dict):
+                continue
+            if str(chat.get("id")) != chat_id:
+                continue
+
+            text = _normalize_confirmation_text(str(message.get("text") or ""))
+            if not text:
+                continue
+
+            if text in approval_yes:
+                return True
+            if text in approval_no:
+                return False
+
+        time.sleep(poll_interval_seconds)
+
+    print(f"Telegram confirmation timed out after {timeout_seconds} seconds.")
+    return False
+
+
+def _resolve_order_confirmation(
+    message: str,
+    use_telegram_confirmation: bool,
+    approval_key: str,
+    telegram_bot_token: str | None,
+    telegram_chat_id: str | None,
+) -> bool:
+    if use_telegram_confirmation:
+        token = telegram_bot_token or os.getenv("TELEGRAM_BOT_TOKEN")
+        return _telegram_confirmation_reply(
+            token=token or "",
+            chat_id=telegram_chat_id,
+            approval_key=approval_key,
+            prompt_message=message,
+        )
+    return _prompt_order_confirmation(message)
+
+
+def _run_telegram_confirmation_test(
+    telegram_bot_token: str | None,
+    telegram_chat_id: str | None,
+) -> bool:
+    token = telegram_bot_token or os.getenv("TELEGRAM_BOT_TOKEN")
+    chat = telegram_chat_id or os.getenv("TELEGRAM_CHAT_ID")
+    approval_key = _make_approval_key("TST", datetime.now().strftime("%Y%m%d%H%M%S"))
+    message = (
+        "Telegram confirmation test.\n\n"
+        f"Reply with <b>YES {approval_key}</b> to confirm the bot can receive replies or "
+        f"<b>NO {approval_key}</b> to reject."
+    )
+    print(f"Sending Telegram confirmation test with approval key: {approval_key}")
+    return _telegram_confirmation_reply(
+        token=token or "",
+        chat_id=chat,
+        approval_key=approval_key,
+        prompt_message=message,
+        timeout_seconds=180,
+        poll_interval_seconds=2.5,
+    )
+
+
 def _print_live_signal_context(source_table: str, current_rsi: float, latest_close: float | None, ltp: float) -> None:
     if latest_close is None:
         print(f"Live RSI {source_table}: {current_rsi:.2f} | LTP: {ltp:.2f}")
@@ -1774,6 +2463,7 @@ def handle_source_table(
     buy_rsi_protection: float = 0.0,
     broker: str = "upstox",
     confirm_order: bool = False,
+    confirm_order_telegram: bool = False,
  ) -> None:
     table_rules = heatmap_df[heatmap_df["source_table"] == source_table]
     if table_rules.empty:
@@ -1793,27 +2483,33 @@ def handle_source_table(
         current_rsi,
     )
     for basket_product, basket_buy_rows in basket_groups.items():
-        if len(basket_buy_rows) < 2:
+        qualifying_rows = [row for row in basket_buy_rows if float(ltp) > float(row[3])]
+        if len(qualifying_rows) < 2:
             continue
-        if attempt_basket_sell(
-            conn,
-            source_table,
-            current_rsi,
-            ltp,
-            latest_close,
-            signal_date,
-            signal_timestamp,
-            basket_buy_rows,
-            excluded_today_buy_ids,
-            min_profit_pct,
-            send_to_telegram,
-            telegram_bot_token,
-            telegram_chat_id,
-            broker,
-            confirm_order,
-            dry_run,
-        ):
-            basket_executed = True
+        basket_clusters = split_basket_buy_rows_by_dispersion(qualifying_rows)
+        for basket_buy_cluster in basket_clusters:
+            if len(basket_buy_cluster) < 2:
+                continue
+            if attempt_basket_sell(
+                conn,
+                source_table,
+                current_rsi,
+                ltp,
+                latest_close,
+                signal_date,
+                signal_timestamp,
+                basket_buy_cluster,
+                excluded_today_buy_ids,
+                min_profit_pct,
+                send_to_telegram,
+                telegram_bot_token,
+                telegram_chat_id,
+                broker,
+                confirm_order,
+                confirm_order_telegram,
+                dry_run,
+            ):
+                basket_executed = True
     if basket_executed:
         return
 
@@ -1864,25 +2560,53 @@ def handle_source_table(
         qty = int(buy_qty)
         pnl = round((float(ltp) - float(buy_ltp)) * float(qty), 2)
         pnl_pct = round(((float(ltp) - float(buy_ltp)) / float(buy_ltp)) * 100.0, 4) if float(buy_ltp) else 0.0
-        if pnl <= SELL_AMC_CHARGE:
+        same_day_sell = _is_same_calendar_day(buy_signal_date, signal_date)
+        estimated_sell_breakdown = estimate_zerodha_sell_cost_breakdown(
+            float(ltp) * float(qty),
+            qty,
+            buy_product,
+            same_day=same_day_sell,
+        )
+        estimated_sell_cost = float(estimated_sell_breakdown["total"])
+        estimated_buy_cost = float(
+            estimate_zerodha_buy_cost_breakdown(
+                float(buy_ltp) * float(qty),
+                qty,
+                buy_product,
+                same_day=same_day_sell,
+            )["total"]
+        )
+        estimated_net_pnl = round(pnl - estimated_buy_cost - estimated_sell_cost, 2)
+        if pnl <= estimated_sell_cost:
             print(
                 f"Skipping SELL {source_table} for buy_id={buy_id}: "
-                f"PnL={pnl:.2f} <= AMC charge {SELL_AMC_CHARGE:.2f}"
+                f"PnL={pnl:.2f} <= estimated Zerodha sell cost {estimated_sell_cost:.2f}"
             )
             continue
         _print_live_signal_context(source_table, current_rsi, latest_close, ltp)
         message = (
             f"SELL {source_table} | closed_buy_id={buy_id} | bucket=({buy_entry_rsi},{buy_exit_rsi}) | "
             f"BUY PRICE {buy_ltp:.2f} | SELL LTP {ltp:.2f} | Qty {qty} | PnL {pnl:.2f} ({pnl_pct:.4f}%) | "
+            f"est_cost {estimated_sell_cost:.2f} | est_net_pnl {estimated_net_pnl:.2f} | "
+            f"cost_breakdown [{format_zerodha_sell_cost_breakdown(estimated_sell_breakdown)}] | "
             f"RSI {current_rsi:.2f}"
         )
         print(message)
-        if confirm_order:
+        if confirm_order or confirm_order_telegram:
             prompt = (
                 f"Confirm SELL {source_table} | qty={qty} | BUY LTP={buy_ltp:.2f} | "
-                f"SELL LTP={ltp:.2f} | PnL={pnl:.2f} ? [Y/N]: "
+                f"SELL LTP={ltp:.2f} | PnL={pnl:.2f} | est_cost={estimated_sell_cost:.2f} | "
+                f"est_net_pnl={estimated_net_pnl:.2f} | "
+                f"breakdown=[{format_zerodha_sell_cost_breakdown(estimated_sell_breakdown)}] ? [Y/N]: "
             )
-            if not _prompt_order_confirmation(prompt):
+            approval_key = _make_approval_key("SL", source_table, buy_id, signal_timestamp)
+            if not _resolve_order_confirmation(
+                prompt,
+                confirm_order_telegram,
+                approval_key,
+                telegram_bot_token,
+                telegram_chat_id,
+            ):
                 fail_reason = "user declined order confirmation"
                 print(f"SELL {source_table} skipped: {fail_reason}.")
                 inserted_id = insert_signal_row(
@@ -1902,6 +2626,7 @@ def handle_source_table(
                         "notes": f"SKIPPED | {fail_reason} | BUY_PRICE={buy_ltp:.2f} | PnL={pnl:.2f}",
                         "position_state": SELL_CONFIRMED_STATE,
                         "buy_signal_id": buy_id,
+                        "net_pnl": estimated_net_pnl,
                         "trigger_exit_rsi": buy_exit_rsi,
                         "action_timestamp": signal_timestamp,
                         "closed_by_signal_id": None,
@@ -1936,13 +2661,14 @@ def handle_source_table(
                     "product": buy_product,
                     "signal_date": signal_date,
                     "signal_timestamp": signal_timestamp,
-                    "notes": f"DRY_RUN | {sell_reason} | BUY_PRICE={buy_ltp:.2f} | PnL={pnl:.2f}",
-                    "position_state": SELL_CONFIRMED_STATE,
-                    "buy_signal_id": buy_id,
-                    "trigger_exit_rsi": buy_exit_rsi,
-                    "action_timestamp": signal_timestamp,
-                    "closed_by_signal_id": None,
-                },
+                        "notes": f"DRY_RUN | {sell_reason} | BUY_PRICE={buy_ltp:.2f} | PnL={pnl:.2f}",
+                        "position_state": SELL_CONFIRMED_STATE,
+                        "buy_signal_id": buy_id,
+                        "net_pnl": estimated_net_pnl,
+                        "trigger_exit_rsi": buy_exit_rsi,
+                        "action_timestamp": signal_timestamp,
+                        "closed_by_signal_id": None,
+                    },
                 table_name=ALL_SIGNAL_LOG_TABLE,
                 order_status="DRY_RUN",
                 order_reason="dry run",
@@ -1985,6 +2711,7 @@ def handle_source_table(
                     "notes": f"SKIPPED | {fail_reason} | BUY_PRICE={buy_ltp:.2f} | PnL={pnl:.2f}",
                     "position_state": SELL_CONFIRMED_STATE,
                     "buy_signal_id": buy_id,
+                    "net_pnl": estimated_net_pnl,
                     "trigger_exit_rsi": buy_exit_rsi,
                     "action_timestamp": signal_timestamp,
                     "closed_by_signal_id": None,
@@ -2011,21 +2738,31 @@ def handle_source_table(
             return
 
         try:
-            update_signal_execution_details = get_update_signal_execution_details(broker)
-
             resolved_qty = int(order_result.get("qty") or qty)
             resolved_product = str(order_result.get("product") or buy_product or "").strip() or None
-            if update_signal_execution_details is not None:
-                if update_signal_execution_details(
-                    buy_id,
+            same_day_sell = _is_same_calendar_day(buy_signal_date, signal_date)
+            sell_breakdown = estimate_zerodha_sell_cost_breakdown(
+                float(ltp) * float(resolved_qty),
+                resolved_qty,
+                resolved_product,
+                same_day=same_day_sell,
+            )
+            sell_cost_total = float(sell_breakdown["total"])
+            buy_cost_total = float(
+                estimate_zerodha_buy_cost_breakdown(
+                    float(buy_ltp) * float(resolved_qty),
                     resolved_qty,
                     resolved_product,
-                    db_path=DB_PATH,
-                ):
-                    print(
-                        f"Updated {SIGNAL_LOG_TABLE} for signal_id={buy_id} "
-                        f"with qty={resolved_qty}."
-                    )
+                    same_day=same_day_sell,
+                )["total"]
+            )
+            sell_gross_pnl = round((float(ltp) - float(buy_ltp)) * float(resolved_qty), 2)
+            sell_net_pnl = round(sell_gross_pnl - buy_cost_total - sell_cost_total, 2)
+            if update_signal_execution_details_local(conn, buy_id, resolved_qty, resolved_product):
+                print(
+                    f"Updated {SIGNAL_LOG_TABLE} for signal_id={buy_id} "
+                    f"with qty={resolved_qty}."
+                )
         except Exception as exc:
             print(
                 f"Warning: failed to update execution details for signal_id={buy_id}: {exc}"
@@ -2048,6 +2785,7 @@ def handle_source_table(
                 "notes": f"{sell_reason} | BUY_PRICE={buy_ltp:.2f} | PnL={pnl:.2f}",
                 "position_state": SELL_CONFIRMED_STATE,
                 "buy_signal_id": buy_id,
+                "net_pnl": sell_net_pnl,
                 "trigger_exit_rsi": buy_exit_rsi,
                 "action_timestamp": signal_timestamp,
                 "closed_by_signal_id": None,
@@ -2070,6 +2808,7 @@ def handle_source_table(
                 "notes": f"{sell_reason} | BUY_PRICE={buy_ltp:.2f} | PnL={pnl:.2f}",
                 "position_state": SELL_CONFIRMED_STATE,
                 "buy_signal_id": buy_id,
+                "net_pnl": sell_net_pnl,
                 "trigger_exit_rsi": buy_exit_rsi,
                 "action_timestamp": signal_timestamp,
                 "closed_by_signal_id": None,
@@ -2133,10 +2872,9 @@ def handle_source_table(
         )
         _print_live_signal_context(source_table, current_rsi, latest_close, ltp)
         print(message)
-        if confirm_order:
+        if confirm_order or confirm_order_telegram:
             try:
                 from zerodha_order_manager import (
-                    DAILY_LIMIT,
                     add_today_reject,
                     is_today_rejected,
                     validate_trade_amount,
@@ -2171,6 +2909,7 @@ def handle_source_table(
                     return
 
                 available_funds = get_order_manager_class("zerodha")().get_available_margin()
+                configured_per_trade_value, configured_daily_limit = _load_zerodha_trade_limits()
                 prompt_qty, prompt_order_value, used_today = validate_trade_amount(
                     source_table,
                     ltp,
@@ -2179,9 +2918,17 @@ def handle_source_table(
                 prompt = (
                     f"Confirm BUY {source_table} | qty={prompt_qty} | order_value={prompt_order_value:.2f} | "
                     f"available_funds={available_funds:.2f} | "
-                    f"remaining_daily_limit={max(0.0, DAILY_LIMIT - used_today):.2f} ? [Y/N]: "
+                    f"remaining_daily_limit={max(0.0, configured_daily_limit - used_today):.2f} | "
+                    f"PER_TRADE_VALUE={configured_per_trade_value:.2f} ? [Y/N]: "
                 )
-                if not _prompt_order_confirmation(prompt):
+                approval_key = _make_approval_key("BK", source_table, entry_rsi, signal_timestamp, prompt_qty)
+                if not _resolve_order_confirmation(
+                    prompt,
+                    confirm_order_telegram,
+                    approval_key,
+                    telegram_bot_token,
+                    telegram_chat_id,
+                ):
                     fail_reason = "user declined order confirmation"
                     print(f"BUY {source_table} skipped: {fail_reason}.")
                     inserted_id = _insert_all_signal_buy_skip(
@@ -2320,10 +3067,10 @@ def handle_source_table(
         buy_qty = order_result.get("qty")
         if buy_qty is None:
             try:
-                from zerodha_order_manager import PER_TRADE_VALUE as ZERODHA_PER_TRADE_VALUE
+                buy_limit, _daily_limit = _load_zerodha_trade_limits()
             except Exception:
-                ZERODHA_PER_TRADE_VALUE = 0.0
-            buy_qty = max(1, int(float(ZERODHA_PER_TRADE_VALUE) // float(ltp))) if float(ZERODHA_PER_TRADE_VALUE) > 0 else 1
+                buy_limit = 0.0
+            buy_qty = max(1, int(float(buy_limit) // float(ltp))) if float(buy_limit) > 0 else 1
         buy_product = order_result.get("product") or "D"
         buy_id = insert_signal_row(
             conn,
@@ -2418,6 +3165,9 @@ def main() -> None:
     print("Price feed: Upstox live websocket")
     print(f"Order execution broker: {get_broker_display_name(broker)}")
     print(f"Confirm order: {getattr(args, 'confirmOrder', False)}")
+    print(f"Confirm order via Telegram: {getattr(args, 'confirmOrderTelegram', False)}")
+    configured_per_trade_value, configured_daily_limit = _load_zerodha_trade_limits()
+    print(f"Zerodha trade limits: PER_TRADE_VALUE={configured_per_trade_value:.2f} DAILY_LIMIT={configured_daily_limit:.2f}")
     print(f"Telegram: {'ENABLED' if getattr(args, 'telegram', False) else 'DISABLED'}  token_sample={bot_sample} chat_sample={chat_sample}")
     print("BUY sizing: PER_TRADE_VALUE is the maximum order cap, with DAILY_LIMIT and available funds checks.")
     print(f"Active protections: {', '.join(protections) if protections else 'None'}")
@@ -2447,6 +3197,16 @@ def main() -> None:
             print(f"Unable to read {get_broker_display_name(broker)} available funds at startup: {exc}")
             print("-" * 48 + "\n")
 
+    if getattr(args, "telegramConfirmTest", False):
+        ok = _run_telegram_confirmation_test(
+            getattr(args, "telegram_bot_token", None),
+            getattr(args, "telegram_chat_id", None),
+        )
+        if not ok:
+            raise RuntimeError("Telegram confirmation test failed or timed out.")
+        print("Telegram confirmation test completed successfully.")
+        return
+
     if getattr(args, "sync_daily_data", True):
         try:
             run_daily_quant_sync(requested_symbols)
@@ -2459,9 +3219,15 @@ def main() -> None:
         conn.execute("PRAGMA journal_mode = WAL")
         ensure_signal_log_table(conn)
         if args.results:
-            if not table_exists(conn, SIGNAL_LOG_TABLE):
-                raise RuntimeError(f"Signal log table '{SIGNAL_LOG_TABLE}' does not exist.")
-            print_trade_results(conn)
+            report_script = Path(__file__).resolve().with_name("trade_report.py")
+            if not report_script.exists():
+                raise RuntimeError(f"Report script not found: {report_script.name}")
+            completed = subprocess.run(
+                [sys.executable, str(report_script)],
+                check=False,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError(f"trade_report.py exited with status {completed.returncode}")
             return
 
         if not table_exists(conn, HEATMAP_TABLE):
@@ -2557,6 +3323,7 @@ def main() -> None:
                     buy_rsi_protection=getattr(args, "buy_rsi_protection", 0.0),
                     broker=broker,
                     confirm_order=getattr(args, "confirmOrder", False),
+                    confirm_order_telegram=getattr(args, "confirmOrderTelegram", False),
                 )
 
             print("-----------------------------------------------------------------------------------------------")

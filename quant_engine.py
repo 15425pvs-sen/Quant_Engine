@@ -42,6 +42,7 @@ SYSTEM_TABLES = {
     "quant_engine_steps",
 }
 REQUIRED_COLS = {"trade_date", "close", "rsi"}
+RUNNING_RUN_STALE_MINUTES = 30
 
 
 def utc_now() -> str:
@@ -156,6 +157,30 @@ def has_running_run_today(conn: sqlite3.Connection) -> bool:
         (today,),
     ).fetchone()
     return row is not None
+
+
+def cleanup_stale_running_runs(conn: sqlite3.Connection, stale_minutes: int = RUNNING_RUN_STALE_MINUTES) -> int:
+    cutoff = datetime.now(IST) - timedelta(minutes=stale_minutes)
+    rows = conn.execute(
+        """
+        SELECT run_id, started_at
+        FROM quant_engine_runs
+        WHERE substr(started_at, 1, 10) = ?
+          AND status = 'running'
+        ORDER BY run_id ASC
+        """,
+        (utc_now()[:10],),
+    ).fetchall()
+    cleared = 0
+    for run_id, started_at in rows:
+        try:
+            started_dt = datetime.fromisoformat(str(started_at))
+        except ValueError:
+            continue
+        if started_dt < cutoff:
+            finish_run(conn, int(run_id), "failed", "Auto-marked stale running run before rerun.")
+            cleared += 1
+    return cleared
 
 
 def finish_run(conn: sqlite3.Connection, run_id: int, status: str, error_message: str | None = None) -> None:
@@ -383,6 +408,10 @@ def main() -> None:
     run_conn = sqlite3.connect(DB_PATH)
     try:
         ensure_engine_tables(run_conn)
+
+        cleared_runs = cleanup_stale_running_runs(run_conn)
+        if cleared_runs:
+            print(f"Cleared {cleared_runs} stale running quant_engine run(s) from today before starting a new run.")
 
         if has_running_run_today(run_conn):
             today = utc_now()[:10]

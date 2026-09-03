@@ -42,15 +42,119 @@ from zerodha_kite import create_kite_client
 DB_PATH = Path(__file__).resolve().parent / "quant_historic_data.db"
 SIGNAL_LOG_TABLE = "rsi_live_signal_log_trading"
 TOKEN_FILE = Path(__file__).with_name("zerodha_tokens.json")
-DAILY_USAGE_FILE = Path(__file__).resolve().parent / "zerodha_daily_usage.json"
+TRADE_LIMITS_FILE = Path(__file__).resolve().parent / "zerodha_trade_limits.json"
 
-PER_TRADE_VALUE = 4000.0
-DAILY_LIMIT = 25000.0
 DEFAULT_EXCHANGE = "NSE"
 DEFAULT_PRODUCT = "CNC"
 DEFAULT_ORDER_TYPE = "MARKET"
 DEFAULT_VALIDITY = "DAY"
 DEFAULT_MARKET_PROTECTION = float(os.getenv("ZERODHA_MARKET_PROTECTION", "1.0"))
+DB_CONNECT_TIMEOUT_SECONDS = 5
+DB_BUSY_TIMEOUT_MS = 5000
+DB_RETRY_ATTEMPTS = 5
+DB_RETRY_BASE_SLEEP_SECONDS = 0.2
+
+
+def _connect_sqlite(db_path: Path, timeout_seconds: int = DB_CONNECT_TIMEOUT_SECONDS) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path, timeout=float(timeout_seconds))
+    conn.execute(f"PRAGMA busy_timeout = {DB_BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA journal_mode = WAL")
+    return conn
+
+
+def _sleep_backoff(attempt: int) -> None:
+    time.sleep(DB_RETRY_BASE_SLEEP_SECONDS * attempt)
+
+
+def _load_trade_limits() -> tuple[float, float]:
+    default_per_trade_value = 15000.0
+    default_daily_limit = 60000.0
+    if not TRADE_LIMITS_FILE.exists():
+        return default_per_trade_value, default_daily_limit
+
+    try:
+        with TRADE_LIMITS_FILE.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return default_per_trade_value, default_daily_limit
+
+    if not isinstance(data, dict):
+        return default_per_trade_value, default_daily_limit
+
+    try:
+        per_trade_value = float(data.get("PER_TRADE_VALUE", default_per_trade_value))
+    except (TypeError, ValueError):
+        per_trade_value = default_per_trade_value
+    try:
+        daily_limit = float(data.get("DAILY_LIMIT", default_daily_limit))
+    except (TypeError, ValueError):
+        daily_limit = default_daily_limit
+
+    if per_trade_value <= 0:
+        per_trade_value = default_per_trade_value
+    if daily_limit <= 0:
+        daily_limit = default_daily_limit
+    return per_trade_value, daily_limit
+
+
+def _load_trade_limits_payload() -> dict[str, Any]:
+    per_trade_value, daily_limit = _load_trade_limits()
+    payload: dict[str, Any] = {
+        "PER_TRADE_VALUE": per_trade_value,
+        "DAILY_LIMIT": daily_limit,
+        "date": _today_key(),
+        "used_value": 0.0,
+        "reject_list": [],
+    }
+
+    if not TRADE_LIMITS_FILE.exists():
+        return payload
+
+    try:
+        with TRADE_LIMITS_FILE.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return payload
+
+    if not isinstance(data, dict):
+        return payload
+
+    payload["PER_TRADE_VALUE"] = per_trade_value
+    payload["DAILY_LIMIT"] = daily_limit
+    usage_date = str(data.get("date", _today_key()))
+    payload["date"] = usage_date
+
+    try:
+        payload["used_value"] = float(data.get("used_value", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        payload["used_value"] = 0.0
+
+    rejects_raw = data.get("reject_list", [])
+    if isinstance(rejects_raw, list):
+        payload["reject_list"] = sorted({str(item).strip().upper() for item in rejects_raw if str(item).strip()})
+    return payload
+
+
+def _save_trade_limits_payload(payload: dict[str, Any]) -> None:
+    current_payload = _load_trade_limits_payload()
+    current_payload.update(
+        {
+            "PER_TRADE_VALUE": float(payload.get("PER_TRADE_VALUE", current_payload["PER_TRADE_VALUE"])),
+            "DAILY_LIMIT": float(payload.get("DAILY_LIMIT", current_payload["DAILY_LIMIT"])),
+            "date": str(payload.get("date", current_payload["date"])),
+            "used_value": round(float(payload.get("used_value", current_payload["used_value"])), 2),
+            "reject_list": sorted({str(item).strip().upper() for item in payload.get("reject_list", current_payload["reject_list"]) if str(item).strip()}),
+        }
+    )
+    with TRADE_LIMITS_FILE.open("w", encoding="utf-8") as handle:
+        json.dump(current_payload, handle, indent=2)
+
+
+PER_TRADE_VALUE, DAILY_LIMIT = _load_trade_limits()
+
+
+def get_trade_limits() -> tuple[float, float]:
+    return _load_trade_limits()
 
 
 def _today_key() -> str:
@@ -182,18 +286,7 @@ def _lookup_path(payload: Any, *path: str) -> Any:
 
 def get_today_usage() -> tuple[str, float]:
     today = _today_key()
-    if not DAILY_USAGE_FILE.exists():
-        return today, 0.0
-
-    try:
-        with DAILY_USAGE_FILE.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return today, 0.0
-
-    if not isinstance(data, dict):
-        return today, 0.0
-
+    data = _load_trade_limits_payload()
     usage_date = str(data.get("date", today))
     if usage_date != today:
         return today, 0.0
@@ -203,18 +296,7 @@ def get_today_usage() -> tuple[str, float]:
 
 def get_today_rejects() -> tuple[str, list[str]]:
     today = _today_key()
-    if not DAILY_USAGE_FILE.exists():
-        return today, []
-
-    try:
-        with DAILY_USAGE_FILE.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return today, []
-
-    if not isinstance(data, dict):
-        return today, []
-
+    data = _load_trade_limits_payload()
     usage_date = str(data.get("date", today))
     if usage_date != today:
         return today, []
@@ -227,14 +309,10 @@ def get_today_rejects() -> tuple[str, list[str]]:
 
 
 def save_today_usage(date_str: str, used_value: float) -> None:
-    payload = {
-        "date": date_str,
-        "used_value": round(float(used_value), 2),
-    }
-    _, rejects = get_today_rejects()
-    payload["reject_list"] = rejects
-    with DAILY_USAGE_FILE.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
+    payload = _load_trade_limits_payload()
+    payload["date"] = date_str
+    payload["used_value"] = round(float(used_value), 2)
+    _save_trade_limits_payload(payload)
 
 
 def add_today_reject(symbol: str) -> None:
@@ -247,13 +325,11 @@ def add_today_reject(symbol: str) -> None:
     _, rejects = get_today_rejects()
     rejects_set = {item.upper() for item in rejects}
     rejects_set.add(symbol)
-    payload = {
-        "date": today,
-        "used_value": round(float(used_today), 2),
-        "reject_list": sorted(rejects_set),
-    }
-    with DAILY_USAGE_FILE.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
+    payload = _load_trade_limits_payload()
+    payload["date"] = today
+    payload["used_value"] = round(float(used_today), 2)
+    payload["reject_list"] = sorted(rejects_set)
+    _save_trade_limits_payload(payload)
 
 
 def is_today_rejected(symbol: str) -> bool:
@@ -283,11 +359,12 @@ def validate_trade_amount(
     ltp: float,
     available_margin: float | None = None,
 ) -> tuple[int, float, float]:
+    per_trade_value, daily_limit = get_trade_limits()
     if ltp <= 0:
         raise ValueError("ltp must be greater than zero.")
-    if PER_TRADE_VALUE <= 0:
+    if per_trade_value <= 0:
         raise ValueError("PER_TRADE_VALUE must be greater than zero.")
-    if DAILY_LIMIT <= 0:
+    if daily_limit <= 0:
         raise ValueError("DAILY_LIMIT must be greater than zero.")
 
     usage_date, used_today = get_today_usage()
@@ -295,14 +372,14 @@ def validate_trade_amount(
     if usage_date != today:
         used_today = 0.0
 
-    remaining_today = max(0.0, DAILY_LIMIT - used_today)
-    available_budget = max(0.0, float(available_margin)) if available_margin is not None else PER_TRADE_VALUE
-    spend_budget = min(float(PER_TRADE_VALUE), remaining_today, available_budget)
+    remaining_today = max(0.0, daily_limit - used_today)
+    available_budget = max(0.0, float(available_margin)) if available_margin is not None else per_trade_value
+    spend_budget = min(float(per_trade_value), remaining_today, available_budget)
     qty = int(spend_budget // ltp)
     if qty <= 0:
         raise ValueError(
             f"Order quantity came out to zero for {symbol} at LTP {ltp:.2f}. "
-            f"PER_TRADE_VALUE {PER_TRADE_VALUE:.2f}, remaining {remaining_today:.2f}, "
+            f"PER_TRADE_VALUE {per_trade_value:.2f}, remaining {remaining_today:.2f}, "
             f"available_funds {available_budget:.2f}."
         )
 
@@ -310,10 +387,23 @@ def validate_trade_amount(
     return qty, order_value, used_today
 
 
+def get_remaining_daily_limit() -> float:
+    _, daily_limit = get_trade_limits()
+    _, used_today = get_today_usage()
+    return max(0.0, float(daily_limit) - float(used_today))
+
+
 def update_daily_usage(order_value: float) -> None:
     today = _today_key()
     _, used_today = get_today_usage()
     save_today_usage(today, used_today + float(order_value))
+
+
+def credit_daily_usage(order_value: float) -> None:
+    today = _today_key()
+    _, used_today = get_today_usage()
+    new_used = max(0.0, float(used_today) - float(order_value))
+    save_today_usage(today, new_used)
 
 
 def quote_identifier(identifier: str) -> str:
@@ -351,25 +441,35 @@ def fetch_signal_row(signal_id: int, db_path: Path = DB_PATH) -> Dict[str, Any] 
     if signal_id <= 0 or not db_path.exists():
         return None
 
-    try:
-        with sqlite3.connect(db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            if table_exists(conn, SIGNAL_LOG_TABLE):
-                ensure_signal_qty_column(conn)
-                row = conn.execute(
-                    f"""
-                    SELECT id, source_table, signal_type, qty, product, buy_signal_id, position_state,
-                           signal_date, signal_timestamp, action_timestamp, closed_by_signal_id, basket_buy_ids,
-                           entry_rsi, exit_rsi, current_rsi, notes
-                    FROM {quote_identifier(SIGNAL_LOG_TABLE)}
-                    WHERE id = ?
-                    """,
-                    (int(signal_id),),
-                ).fetchone()
-                return dict(row) if row is not None else None
-    except sqlite3.Error as exc:
-        print(f"Warning: failed to fetch signal row {signal_id}: {exc}")
-        return None
+    last_exc: Exception | None = None
+    for attempt in range(1, DB_RETRY_ATTEMPTS + 1):
+        try:
+            with _connect_sqlite(db_path, timeout_seconds=DB_CONNECT_TIMEOUT_SECONDS) as conn:
+                conn.row_factory = sqlite3.Row
+                if table_exists(conn, SIGNAL_LOG_TABLE):
+                    ensure_signal_qty_column(conn)
+                    row = conn.execute(
+                        f"""
+                        SELECT id, source_table, signal_type, qty, product, buy_signal_id, position_state,
+                               signal_date, signal_timestamp, action_timestamp, closed_by_signal_id, basket_buy_ids,
+                               entry_rsi, exit_rsi, current_rsi, notes
+                        FROM {quote_identifier(SIGNAL_LOG_TABLE)}
+                        WHERE id = ?
+                        """,
+                        (int(signal_id),),
+                    ).fetchone()
+                    return dict(row) if row is not None else None
+        except sqlite3.OperationalError as exc:
+            last_exc = exc
+            if "locked" not in str(exc).lower() or attempt >= DB_RETRY_ATTEMPTS:
+                break
+            _sleep_backoff(attempt)
+            continue
+        except sqlite3.Error as exc:
+            print(f"Warning: failed to fetch signal row {signal_id}: {exc}")
+            return None
+    if last_exc is not None:
+        print(f"Warning: failed to fetch signal row {signal_id}: {last_exc}")
     return None
 
 
@@ -401,11 +501,9 @@ def update_signal_execution_details(
     last_exc: Exception | None = None
     desired_qty = int(qty)
     desired_product = product
-    for attempt in range(1, 6):
+    for attempt in range(1, DB_RETRY_ATTEMPTS + 1):
         try:
-            with sqlite3.connect(db_path, timeout=30) as conn:
-                conn.execute("PRAGMA busy_timeout = 30000")
-                conn.execute("PRAGMA journal_mode = WAL")
+            with _connect_sqlite(db_path, timeout_seconds=DB_CONNECT_TIMEOUT_SECONDS) as conn:
                 ensure_signal_qty_column(conn)
                 cursor = conn.execute(
                     f"UPDATE {quote_identifier(SIGNAL_LOG_TABLE)} SET qty = ?, product = ? WHERE id = ?",
@@ -421,18 +519,17 @@ def update_signal_execution_details(
                 return True
         except sqlite3.OperationalError as exc:
             last_exc = exc
-            if "locked" not in str(exc).lower() or attempt >= 5:
+            if "locked" not in str(exc).lower() or attempt >= DB_RETRY_ATTEMPTS:
                 break
+            _sleep_backoff(attempt)
             continue
         except sqlite3.Error as exc:
             last_exc = exc
             break
 
     try:
-        for _ in range(10):
-            with sqlite3.connect(db_path, timeout=30) as conn:
-                conn.execute("PRAGMA busy_timeout = 30000")
-                conn.execute("PRAGMA journal_mode = WAL")
+        for attempt in range(1, DB_RETRY_ATTEMPTS + 1):
+            with _connect_sqlite(db_path, timeout_seconds=DB_CONNECT_TIMEOUT_SECONDS) as conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute(
                     f"SELECT qty, product FROM {quote_identifier(SIGNAL_LOG_TABLE)} WHERE id = ?",
@@ -443,7 +540,7 @@ def update_signal_execution_details(
                     current_product = row["product"]
                     if int(current_qty or 0) == desired_qty and str(current_product or "") == str(desired_product or ""):
                         return True
-            time.sleep(0.25)
+            _sleep_backoff(attempt)
     except sqlite3.Error:
         pass
 
@@ -666,6 +763,7 @@ class ZerodhaOrderManager:
         exchange: str,
         required_qty: int,
         preferred_product: str | None = None,
+        linked_trade_dt: datetime | None = None,
     ) -> tuple[str, int, str]:
         if required_qty <= 0:
             raise ZerodhaOrderError("required_qty must be positive.")
@@ -673,11 +771,18 @@ class ZerodhaOrderManager:
         positions = self.get_positions()
         holdings = self.get_holdings()
         preferred_product = _signal_product_to_kite_product(preferred_product)
+        is_same_day_trade = False
+        if linked_trade_dt is not None:
+            try:
+                is_same_day_trade = linked_trade_dt.date() == datetime.now().date()
+            except Exception:
+                is_same_day_trade = False
 
         candidates: list[tuple[str, int, str]] = []
         for product_name, rows, source in (
             ("MIS", positions, "positions"),
             ("NRML", positions, "positions"),
+            ("CNC", positions, "positions"),
             ("CNC", holdings, "holdings"),
         ):
             available = (
@@ -689,17 +794,32 @@ class ZerodhaOrderManager:
                 candidates.append((product_name, available, source))
 
         if preferred_product in {"CNC", "MIS", "NRML"}:
-            preferred_source = "holdings" if preferred_product == "CNC" else "positions"
+            if preferred_product == "CNC":
+                preferred_source = "positions" if is_same_day_trade else "holdings"
+            else:
+                preferred_source = "positions"
             preferred_available = (
-                _available_holdings_quantity(holdings, symbol, exchange, product=preferred_product)
-                if preferred_source == "holdings"
-                else _available_positions_quantity(positions, symbol, exchange, product=preferred_product)
+                _available_positions_quantity(positions, symbol, exchange, product=preferred_product)
+                if preferred_source == "positions"
+                else _available_holdings_quantity(holdings, symbol, exchange, product=preferred_product)
             )
             if preferred_available <= 0:
+                if preferred_product == "CNC" and linked_trade_dt is not None:
+                    print(
+                        f"Live Zerodha CNC inventory not found for {symbol} on {exchange}; "
+                        f"using linked BUY quantity from DB."
+                    )
+                    return preferred_product, required_qty, "signal_db_linked"
                 raise ZerodhaOrderError(
                     f"No live {preferred_product} inventory found for {symbol} on {exchange}."
                 )
             if preferred_available < required_qty:
+                if preferred_product == "CNC" and linked_trade_dt is not None:
+                    print(
+                        f"Live Zerodha CNC inventory for {symbol} on {exchange} is stale/incomplete; "
+                        f"using linked BUY quantity from DB."
+                    )
+                    return preferred_product, required_qty, "signal_db_linked"
                 raise ZerodhaOrderError(
                     f"Insufficient live {preferred_product} inventory for {symbol} on {exchange}. "
                     f"Required {required_qty}, available {preferred_available}."
@@ -852,12 +972,13 @@ def main() -> None:
                 args.ltp,
                 available_margin=available_margin,
             )
+            per_trade_value, daily_limit = get_trade_limits()
             print(f"Daily used so far: {used_today:.2f}")
-            print(f"Remaining today: {max(0.0, DAILY_LIMIT - used_today):.2f}")
+            print(f"Remaining today: {get_remaining_daily_limit():.2f}")
             print(f"Calculated qty: {qty}")
             print(f"Proposed value: {order_value:.2f}")
-            print(f"Configured PER_TRADE_VALUE: {PER_TRADE_VALUE:.2f}")
-            print(f"Configured DAILY_LIMIT: {DAILY_LIMIT:.2f}")
+            print(f"Configured PER_TRADE_VALUE: {per_trade_value:.2f}")
+            print(f"Configured DAILY_LIMIT: {daily_limit:.2f}")
         except ValueError as exc:
             print(f"BUY {args.symbol} skipped: {exc}")
             return
@@ -889,6 +1010,7 @@ def main() -> None:
                     args.exchange,
                     qty,
                     preferred_product=linked_buy_product,
+                    linked_trade_dt=_basket_trade_dt,
                 )
                 if live_available_qty < qty:
                     raise ZerodhaOrderError(
@@ -932,6 +1054,7 @@ def main() -> None:
                     args.exchange,
                     qty,
                     preferred_product=linked_buy_product,
+                    linked_trade_dt=linked_buy_dt,
                 )
                 if live_available_qty < qty:
                     raise ZerodhaOrderError(
@@ -958,7 +1081,7 @@ def main() -> None:
                 f"Confirm Zerodha BUY order for {args.symbol} | "
                 f"qty={qty} | order_value={order_value:.2f} | "
                 f"available_funds={(available_margin if available_margin is not None else 0.0):.2f} | "
-                f"remaining_daily_limit={max(0.0, DAILY_LIMIT - used_today):.2f} ? [Y/N]: "
+                f"remaining_daily_limit={get_remaining_daily_limit():.2f} ? [Y/N]: "
             )
         else:
             prompt = (
@@ -1006,6 +1129,14 @@ def main() -> None:
 
     if args.side == "BUY":
         update_daily_usage(order_value)
+        print(f"Remaining daily limit after BUY: {get_remaining_daily_limit():.2f}")
+    else:
+        try:
+            credit_daily_usage(order_value)
+            print(f"Credited daily limit by SELL value: {order_value:.2f}")
+            print(f"Remaining daily limit after SELL: {get_remaining_daily_limit():.2f}")
+        except Exception as exc:
+            print(f"Warning: failed to credit SELL value back to daily limit: {exc}")
 
 
 if __name__ == "__main__":
